@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+.DS_Store
+.idea/
+.venv/
+outputs/
+cache/
+checkpoints/
+server_logs/
+*.pth
+*.pt
