@@ -29,7 +29,7 @@ def main():
     parser.add_argument("--checkpoint", required=True)
     parser.add_argument(
         "--dataset",
-        choices=["activitynet", "fcvid", "s5vh_activitynet", "s5vh_fcv", "s5vh_hmdb", "s5vh_ucf"],
+        choices=["activitynet", "fcvid", "hmdb", "s5vh_activitynet", "s5vh_fcv", "s5vh_hmdb", "s5vh_ucf"],
         default=None,
     )
     parser.add_argument("--split", choices=["train", "val", "test", "retrieval"], default="test")
