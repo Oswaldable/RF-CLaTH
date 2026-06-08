@@ -54,11 +54,11 @@ class RetrievalFeedbackContentLateralTemporalHashing(nn.Module):
         self.feature_projector = FeatureProjector(self.feature_dim, self.hidden_dim)
 
         selector_cfg = model_cfg.get("keyframe_selector", {})
-        selector_strategy = selector_cfg.get("strategy", "segment_rerank_gumbel_topk")
+        selector_strategy = selector_cfg.get("strategy", selector_cfg.get("type", "segment_rerank_gumbel_topk"))
         if not self.use_keyframe_selector:
             raise ValueError(
                 "ablation.use_keyframe_selector=false is no longer supported in the current mainline. "
-                "Use keyframe_selector.strategy='segment_rerank_gumbel_topk' for the E13-K2 selector."
+                "Use an explicit keyframe_selector.strategy for the active selector."
             )
         self.keyframe_selector = KeyFrameSelector(
             d_model=self.hidden_dim,
@@ -71,7 +71,16 @@ class RetrievalFeedbackContentLateralTemporalHashing(nn.Module):
             alpha_motion=float(selector_cfg.get("alpha_motion", 0.10)),
             beta_redundancy=float(selector_cfg.get("beta_redundancy", 0.05)),
             gamma_coverage=float(selector_cfg.get("gamma_coverage", 0.05)),
+            segment_size=int(selector_cfg.get("segment_size", 0)),
+            trainable=bool(selector_cfg.get("trainable", True)),
+            score_weights=selector_cfg.get("score_weights", {}),
+            set_objective_weights=selector_cfg.get("set_objective_weights", {}),
+            search_chunk_size=int(selector_cfg.get("search_chunk_size", 512)),
         )
+        default_selector_source = "input" if self.keyframe_selector.is_training_free else "projected"
+        self.selector_feature_source = str(
+            selector_cfg.get("feature_source", selector_cfg.get("source", default_selector_source))
+        ).lower()
 
         self.slow_encoder = build_slow_encoder(model_cfg, ablation_cfg)
 
@@ -153,9 +162,17 @@ class RetrievalFeedbackContentLateralTemporalHashing(nn.Module):
             raise ValueError(f"Expected {self.num_frames} frames/features, got {x.shape[1]}")
         return x
 
-    def _select_keyframes(self, x: torch.Tensor):
+    def _selector_scoring_features(self, video_or_features: torch.Tensor, projected: torch.Tensor) -> torch.Tensor:
+        if (
+            self.selector_feature_source in {"input", "raw", "features", "raw_features"}
+            and self.input_type == "features"
+        ):
+            return video_or_features
+        return projected
+
+    def _select_keyframes(self, x: torch.Tensor, selector_source: torch.Tensor | None = None):
         if self.use_slow or self.use_keyframe_selector:
-            return self.keyframe_selector(x)
+            return self.keyframe_selector(selector_source if selector_source is not None else x, select_from=x)
         b, t, _ = x.shape
         empty_idx = torch.empty(b, 0, device=x.device, dtype=torch.long)
         empty_mask = torch.zeros(b, t, device=x.device, dtype=x.dtype)
@@ -202,7 +219,8 @@ class RetrievalFeedbackContentLateralTemporalHashing(nn.Module):
         return_one_view: bool = False,
     ) -> Dict[str, torch.Tensor]:
         x = self._encode_input(video_or_features)
-        x_s, selected_indices, slow_mask = self._select_keyframes(x)
+        selector_source = self._selector_scoring_features(video_or_features, x)
+        x_s, selected_indices, slow_mask = self._select_keyframes(x, selector_source=selector_source)
 
         if self.use_slow:
             h_s = None if self.use_lateral_fusion else self.slow_encoder(x_s, full=x, selected_indices=selected_indices)
@@ -289,4 +307,3 @@ class RetrievalFeedbackContentLateralTemporalHashing(nn.Module):
         if was_training:
             self.train()
         return out
-

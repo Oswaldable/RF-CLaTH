@@ -65,6 +65,15 @@ train env: /mnt/disk2/yql/miniconda3/envs/mamba_env/bin/python
 label env: /mnt/disk2/yql/miniconda3/envs/s5vh/bin/python
 ```
 
+测试与验证约束：
+
+```text
+不要在本地执行测试或运行验证脚本。
+包括但不限于 python smoke test、py_compile、pytest、训练、评估、配置加载验证。
+所有测试、训练、评估和 smoke 验证一律通过 ssh exp-server 在远端执行。
+本地只做代码/文档编辑和必要的文本检索检查。
+```
+
 同步本地代码到服务器：
 
 ```bash
@@ -135,9 +144,9 @@ cd /mnt/disk2/yql/RF-CLaTH
 ## 当前主方法
 
 ```text
-selector: segment_rerank_gumbel_topk
+selector: t_sas / per_sas training-free semantic anchor selection
 slow branch: selected_class_attention
-fast branch: bidirectional_mamba mean-pooling
+fast branch: bidirectional_mamba all-frame mean-pooling
 fusion: content_time_lateral
 loss:
   0.3 * L_view
@@ -161,7 +170,7 @@ reconstruction head
 运行 UCF 主方法：
 
 ```bash
-ssh exp-server 'cd /mnt/disk2/yql/RF-CLaTH && BITS="16 32 64 128" tools/run_rf_clath_ucf_disk2.sh <gpu>'
+ssh exp-server 'cd /mnt/disk2/yql/RF-CLaTH && BITS="16 32 64" tools/run_rf_clath_ucf_disk2.sh <gpu>'
 ```
 
 复算指标：
@@ -173,7 +182,8 @@ ssh exp-server 'cd /mnt/disk2/yql/RF-CLaTH && /mnt/disk2/yql/miniconda3/envs/mam
 评估口径：
 
 ```text
-hash bits: 16, 32, 64, 128
+hash bits: 16, 32, 64
+128-bit 后续不再作为实验设置运行。
 train batch: UCF = 256
 eval batch: 256
 P/R@K: 5, 10, 20, 40, 60, 80, 100

@@ -7,9 +7,9 @@ mainline for self-supervised video hashing on the repartitioned S5VH protocol.
 
 The model uses pre-extracted frame features as input:
 
-- keyframe selector: `segment_rerank_gumbel_topk`
+- keyframe selector: training-free `t_sas` / `per_sas` semantic anchor selection
 - slow branch: `SelectedClassAttentionEncoder` over selected semantic frames
-- fast branch: `BidirectionalMambaEncoder` over temporal context
+- fast branch: `BidirectionalMambaEncoder` over all frames
 - fusion: `content_time_lateral`
 - hash head: soft hash code projection with binarization for retrieval
 
@@ -23,9 +23,11 @@ L = 0.3  * L_view
   + 0.03 * L_balance
 ```
 
-`L_batch_neighbor` uses static raw-feature nearest neighbors as retrieval
-feedback. `L_memory_neighbor` uses the online hash memory bank. The final method
-does not use hash centers, prototype alignment, or reconstruction.
+Stage 1 keeps the original RF-CLaTH loss while replacing the trainable selector
+with a deterministic semantic anchor selector. `L_batch_neighbor` uses static
+raw-feature nearest neighbors as retrieval feedback. `L_memory_neighbor` uses
+the online hash memory bank. The method does not use hash centers, prototype
+alignment, or reconstruction.
 
 ## Data
 
@@ -66,7 +68,7 @@ python train.py \
 Remote disk2 entry:
 
 ```bash
-ssh exp-server 'cd /mnt/disk2/yql/RF-CLaTH && BITS="16 32 64 128" tools/run_rf_clath_ucf_disk2.sh <gpu>'
+ssh exp-server 'cd /mnt/disk2/yql/RF-CLaTH && BITS="16 32 64" tools/run_rf_clath_ucf_disk2.sh <gpu>'
 ```
 
 ## Evaluate
@@ -75,7 +77,7 @@ ssh exp-server 'cd /mnt/disk2/yql/RF-CLaTH && BITS="16 32 64 128" tools/run_rf_c
 python tools/compute_s5vh_official_map.py \
   --config configs/rf_clath_ucf.yaml \
   --dataset s5vh_ucf \
-  --checkpoint outputs/rf_clath_ucf/best.pth
+  --checkpoint outputs/rf_clath_t_sas_ucf/best.pth
 ```
 
 Evaluation uses `{-1, +1}` binary codes, `mAP@K` for K in
@@ -90,7 +92,7 @@ python train.py --demo
 
 ## Project Layout
 
-- `configs/rf_clath_ucf.yaml`: final UCF method config
+- `configs/rf_clath_ucf.yaml`: Stage 1 UCF T-SAS + original loss config
 - `models/`: RF-CLaTH model, selector, encoders, fusion, hash head
 - `losses/`: view, neighbor-feedback, quantization, and balance objectives
 - `datasets/`: S5VH repartition feature dataset loaders

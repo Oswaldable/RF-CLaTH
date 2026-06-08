@@ -1,6 +1,6 @@
 project:
-  name: RF-CLaTH-UCF-RePartition
-  output_dir: ./outputs/rf_clath_ucf
+  name: RF-CLaTH-T-SAS-UCF-RePartition
+  output_dir: ./outputs/rf_clath_t_sas_ucf
   seed: 3346
 
 data:
@@ -36,13 +36,20 @@ model:
     pretrained: false
 
   keyframe_selector:
-    strategy: segment_rerank_gumbel_topk
-    temperature: 1.0
-    use_straight_through: true
-    candidate_topm: 2
-    alpha_motion: 0.10
-    beta_redundancy: 0.05
-    gamma_coverage: 0.05
+    strategy: t_sas
+    trainable: false
+    feature_source: input
+    segment_size: 5
+    share_key_idx_across_views: true
+    score_weights:
+      global_repr: 0.4
+      local_repr: 0.5
+      local_stability: 0.1
+    set_objective_weights:
+      coverage: 0.6
+      quality: 0.3
+      redundancy: 0.1
+    search_chunk_size: 512
 
   slow_encoder:
     type: selected_class_attention
@@ -57,6 +64,7 @@ model:
 
   fast_encoder:
     type: bidirectional_mamba
+    input_frames: all
     depth: 2
     d_state: 16
     d_conv: 4
@@ -145,5 +153,5 @@ eval:
   topk: [5, 10, 20, 40, 60, 80, 100]
   map_topk: [5, 20, 40, 60, 80, 100]
   gmap_topk: []
-  hash_bits: [16, 32, 64, 128]
+  hash_bits: [16, 32, 64]
   binary_format: pm1

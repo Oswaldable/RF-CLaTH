@@ -10,9 +10,9 @@
 当前 KAMCH 原始实现已经不是弱 baseline，而是一个强基线。实验记录显示：
 
 - RePartition 协议已固定，后续实验应继续使用该协议，避免因数据划分或评估口径变化导致结果不可比。
-- 当前固定 bits 为 `16 / 32 / 64 / 128`。
+- 当前固定 bits 为 `16 / 32 / 64`，后续不再进行 128-bit 实验。
 - 当前训练优化参数为：`epochs=150`，`lr=3e-5`，`warmup_epochs=10`，`weight_decay=1e-4`。
-- HMDB 上 E23-2 在 `16 / 32 / 64 / 128 bit` 的 `mAP@5-100` 全部超过 S5VH。
+- HMDB 上 E23-2 在既有 bit 设置的 `mAP@5-100` 全部超过 S5VH。
 - UCF 上 E23-2 在 head/mid top-K 表现强，但 `mAP@100` 在部分 bit 上近似持平或略低，说明中后段检索结构仍有优化空间。
 - E25-2 w/o center/prototype 在 UCF 16-bit 上没有塌缩，并且 `mAP@100=0.3399` 明显高于 S5VH 16-bit 的 `0.3020` 和 E23-2 16-bit 的 `0.3015`，但 `mAP@5` 低于 E23-2，说明去除强 center/prototype 约束后，中后段邻域检索有更大收益。
 
@@ -83,7 +83,6 @@ UCF 32-bit
 
 ```text
 HMDB 64-bit
-HMDB 128-bit
 ```
 
 原因：
@@ -93,8 +92,8 @@ HMDB 128-bit
 最后扩展：
 
 ```text
-ActivityNet 16/32/64/128
-FCVID 16/32/64/128
+ActivityNet 16/32/64
+FCVID 16/32/64
 ```
 
 ---
@@ -206,7 +205,7 @@ KAMCH 不再以 view-level contrastive learning 为主监督，
 ```yaml
 protocol:
   data_root: /mnt/disk2/yql/dataset_rePartition
-  bits: [16, 32, 64, 128]
+  bits: [16, 32, 64]
   train_batch:
     activitynet: 256
     hmdb: 256
@@ -232,19 +231,15 @@ training:
 | ActivityNet | 16 | | | | | | | |
 | ActivityNet | 32 | | | | | | | |
 | ActivityNet | 64 | | | | | | | |
-| ActivityNet | 128 | | | | | | | |
 | FCVID | 16 | | | | | | | |
 | FCVID | 32 | | | | | | | |
 | FCVID | 64 | | | | | | | |
-| FCVID | 128 | | | | | | | |
 | HMDB | 16 | | | | | | | |
 | HMDB | 32 | | | | | | | |
 | HMDB | 64 | | | | | | | |
-| HMDB | 128 | | | | | | | |
 | UCF | 16 | | | | | | | |
 | UCF | 32 | | | | | | | |
 | UCF | 64 | | | | | | | |
-| UCF | 128 | | | | | | | |
 
 ### 4.4 验收标准
 
@@ -341,7 +336,6 @@ UCF 32-bit
 
 ```text
 HMDB 64-bit
-HMDB 128-bit
 ```
 
 ---
@@ -964,18 +958,17 @@ loss_weights:
 1. UCF 16-bit
 2. UCF 32-bit
 3. HMDB 64-bit
-4. HMDB 128-bit
-5. ActivityNet 16-bit
-6. FCVID 16-bit
+4. ActivityNet 16-bit
+5. FCVID 16-bit
 ```
 
-如果以上稳定，再扩展到四数据集四 bits：
+如果以上稳定，再扩展到四数据集三 bits：
 
 ```text
-ActivityNet: 16 / 32 / 64 / 128
-FCVID:      16 / 32 / 64 / 128
-HMDB:       16 / 32 / 64 / 128
-UCF:        16 / 32 / 64 / 128
+ActivityNet: 16 / 32 / 64
+FCVID:      16 / 32 / 64
+HMDB:       16 / 32 / 64
+UCF:        16 / 32 / 64
 ```
 
 ---
@@ -1178,13 +1171,13 @@ random anchors 更分散。
 |---:|---|---|---|---|
 | P0 | KAMCH-Base official recompute | all | all | 锁定强基线 |
 | P1 | T-SAS + original loss | UCF | 16, 32 | 验证 selector 安全性 |
-| P2 | T-SAS + original loss | HMDB | 64, 128 | 验证 selector 在强 setting 上稳定 |
+| P2 | T-SAS + original loss | HMDB | 64 | 验证 selector 在强 setting 上稳定 |
 | P3 | Static ARF | UCF | 16 | 验证非对比图训练不塌缩 |
 | P4 | ARF without P_z | UCF | 16, 32 | 验证 actual trace feedback |
 | P5 | Full ARF with P_z | UCF | 16, 32 | 验证完整 ARF |
-| P6 | Full ARF with P_z | HMDB | 64, 128 | 验证强基线继续提升 |
-| P7 | Full ARF with P_z | ActivityNet | 16, 32, 64, 128 | 大数据集验证 |
-| P8 | Full ARF with P_z | FCVID | 16, 32, 64, 128 | 大数据集验证 |
+| P6 | Full ARF with P_z | HMDB | 64 | 验证强基线继续提升 |
+| P7 | Full ARF with P_z | ActivityNet | 16, 32, 64 | 大数据集验证 |
+| P8 | Full ARF with P_z | FCVID | 16, 32, 64 | 大数据集验证 |
 | P9 | 完整消融 | UCF/HMDB | selected bits | 支撑论文创新 |
 
 ---
@@ -1194,7 +1187,7 @@ random anchors 更分散。
 ### 13.1 最理想结果
 
 ```text
-Full ARF 在四数据集四 bits 上大部分超过 KAMCH-Base；
+Full ARF 在四数据集三 bits 上大部分超过 KAMCH-Base；
 16/32-bit 提升更明显；
 UCF mAP@20-100 明显修复；
 机制指标 planned/actual overlap 上升；
@@ -1533,17 +1526,16 @@ loss:
 [ ] E26-4 UCF 32-bit
 [ ] E26-5 UCF 32-bit
 [ ] E26-5 HMDB 64-bit
-[ ] E26-5 HMDB 128-bit
 [ ] official recompute
 ```
 
 ### Day Block D：扩展全数据集
 
 ```text
-[ ] ActivityNet 16/32/64/128
-[ ] FCVID 16/32/64/128
-[ ] HMDB 16/32/64/128
-[ ] UCF 16/32/64/128
+[ ] ActivityNet 16/32/64
+[ ] FCVID 16/32/64
+[ ] HMDB 16/32/64
+[ ] UCF 16/32/64
 [ ] 完整 SOTA 对比表
 ```
 
@@ -1680,7 +1672,7 @@ We propose an agentic retrieval feedback mechanism that treats hash codes as ret
 ### 实验完整性
 
 ```text
-[ ] 四数据集四 bits 主结果
+[ ] 四数据集三 bits 主结果
 [ ] 与 S5VH/AutoSSVH/ConMH 等方法对比
 [ ] 与 KAMCH-Base 对比
 [ ] ARF 主消融
@@ -1724,6 +1716,5 @@ We propose an agentic retrieval feedback mechanism that treats hash codes as ret
 先用 T-SAS 安全替换 selector，确保不破坏强 KAMCH；
 再用 Static ARF 验证非对比伪图训练稳定性；
 随后启用 actual retrieval trace 和 missed/false feedback，证明 ARF 的核心价值；
-最后加入 P_z memory graph，扩展到四数据集四 bits，并用递进消融证明这不是普通 pseudo graph learning，而是实际检索行为反馈驱动的哈希学习。
+最后加入 P_z memory graph，扩展到四数据集三 bits，并用递进消融证明这不是普通 pseudo graph learning，而是实际检索行为反馈驱动的哈希学习。
 ```
-
