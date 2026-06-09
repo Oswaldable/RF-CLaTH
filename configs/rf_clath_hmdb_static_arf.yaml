@@ -1,0 +1,167 @@
+project:
+  name: RF-CLaTH-StaticARF-HMDB-RePartition
+  output_dir: ./outputs/rf_clath_static_arf_hmdb
+  seed: 3346
+
+data:
+  name: hmdb
+  cache_in_memory: false
+  num_workers: 8
+  pin_memory: true
+  datasets:
+    hmdb:
+      dataset: hmdb
+      format: s5vh_h5
+      num_classes: 51
+      feature_key: feats
+      train_feature_path: /mnt/disk2/yql/dataset_rePartition/hmdb/hmdb_train_feats.h5
+      val_feature_path: /mnt/disk2/yql/dataset_rePartition/hmdb/hmdb_test_feats.h5
+      test_feature_path: /mnt/disk2/yql/dataset_rePartition/hmdb/hmdb_test_feats.h5
+      retrieval_feature_path: /mnt/disk2/yql/dataset_rePartition/hmdb/hmdb_train_feats.h5
+      train_label_path: ./cache/repartition_s5vh_hmdb_train_label.pt
+      val_label_path: ./cache/repartition_s5vh_hmdb_q_label.pt
+      test_label_path: ./cache/repartition_s5vh_hmdb_q_label.pt
+      retrieval_label_path: ./cache/repartition_s5vh_hmdb_re_label.pt
+
+model:
+  input_type: features
+  num_frames: 25
+  num_keyframes: 5
+  feature_dim: 4096
+  hidden_dim: 512
+  hash_bits: 64
+
+  frame_backbone:
+    type: resnet50
+    pretrained: false
+
+  keyframe_selector:
+    strategy: t_sas
+    trainable: false
+    feature_source: input
+    segment_size: 5
+    share_key_idx_across_views: true
+    score_weights:
+      global_repr: 0.4
+      local_repr: 0.5
+      local_stability: 0.1
+    set_objective_weights:
+      coverage: 0.6
+      quality: 0.3
+      redundancy: 0.1
+    search_chunk_size: 512
+
+  slow_encoder:
+    type: selected_class_attention
+    token_layers: 2
+    class_layers: 2
+    num_queries: 2
+    num_heads: 8
+    mlp_ratio: 2.0
+    dropout: 0.1
+    pooling: attention
+    use_residual_gate: true
+
+  fast_encoder:
+    type: bidirectional_mamba
+    input_frames: all
+    depth: 2
+    d_state: 16
+    d_conv: 4
+    expand: 2
+    pooling: mean
+    use_official_mamba: true
+    strict_official_mamba: true
+
+  mask_aug:
+    mask_ratio: 0.2
+    use_temporal_jitter: true
+    use_frame_dropout: true
+    frame_dropout_ratio: 0.05
+    use_motion_aware_mask: false
+    mask_motion: low
+
+  fusion:
+    type: content_time_lateral
+    dropout: 0.1
+    lateral_temperature: 2.0
+    content_temperature: 0.5
+    num_time_buckets: 30
+    lateral_gamma_init: 0.1
+
+ablation:
+  use_slow_branch: true
+  use_fast_branch: true
+  use_keyframe_selector: true
+  use_mask_aug: true
+  use_hash_con: true
+  slow_encoder_type: selected_class_attention
+  fast_encoder_type: bidirectional_mamba
+
+training:
+  objective: static_arf
+
+loss:
+  type: static_arf
+  static_arf:
+    lambda: 1.0
+
+arf_loss:
+  gamma: 8
+
+loss_weights:
+  lambda_arf: 1.0
+  lambda_quant: 0.10
+  lambda_balance: 0.05
+
+neighbor:
+  enabled: false
+  topk: 20
+  neighbors_per_anchor: 1
+  feature_batch_size: 256
+  sim_chunk_size: 512
+  build_on_cuda: true
+  cache: true
+  cache_path: ./cache/repartition_hmdb_train_rawmean_top20.pt
+  label_precision_probe: 0
+
+planner:
+  enabled: true
+  top_m: 20
+  omega_s: 0.65
+  omega_t: 0.35
+  omega_z: 0.0
+  random_anchors: 40
+  z_momentum: 0.9
+  u_momentum: 0.9
+  log_interval: 20
+  device: auto
+  include_z_metrics: true
+  label_precision: true
+
+train:
+  objective: static_arf
+  batch_size: 256
+  epochs: 150
+  optimizer: adamw
+  lr: 3e-5
+  weight_decay: 1e-4
+  warmup_epochs: 10
+  amp: true
+  grad_clip: 5.0
+  log_interval: 20
+  eval_interval: 5
+  save_interval: 5
+  max_steps_per_epoch: 0
+  early_stop_patience: 0
+  early_stop_min_delta: 0.0
+  resume: ""
+
+eval:
+  split: test
+  batch_size: 256
+  topk: [5, 10, 20, 40, 60, 80, 100]
+  map_topk: [5, 20, 40, 60, 80, 100]
+  gmap_topk: []
+  hash_bits: [16, 32, 64]
+  binary_format: pm1

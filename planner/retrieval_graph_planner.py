@@ -91,6 +91,24 @@ class RetrievalGraphPlanner:
         candidates = candidate_bank[candidate_indices]
         return torch.clamp(anchors @ candidates.t(), min=0.0)
 
+    def _final_scores(
+        self,
+        memory: PlannerMemoryBank,
+        anchors: torch.Tensor,
+        candidates: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+        p_s = self._component_sim(anchors, memory.sem_proto_bank, memory.sem_proto_bank, candidates)
+        p_t = self._component_sim(anchors, memory.dyn_proto_bank, memory.dyn_proto_bank, candidates)
+        self._mask_self(p_s, anchors, candidates)
+        self._mask_self(p_t, anchors, candidates)
+        p_final = self.omega_s * p_s + self.omega_t * p_t
+        p_z: Optional[torch.Tensor] = None
+        if self.omega_z > 0:
+            p_z = self._component_sim(anchors, memory.z_bank, memory.z_bank, candidates)
+            self._mask_self(p_z, anchors, candidates)
+            p_final = p_final + self.omega_z * p_z
+        return p_final, p_s, p_t, p_z
+
     @torch.no_grad()
     def compute_sanity(
         self,
@@ -114,13 +132,8 @@ class RetrievalGraphPlanner:
         if final_candidates.numel() <= 1:
             return metrics
 
-        p_s = self._component_sim(anchors, memory.sem_proto_bank, memory.sem_proto_bank, final_candidates)
-        p_t = self._component_sim(anchors, memory.dyn_proto_bank, memory.dyn_proto_bank, final_candidates)
-        self._mask_self(p_s, anchors, final_candidates)
-        self._mask_self(p_t, anchors, final_candidates)
-        p_final = self.omega_s * p_s + self.omega_t * p_t
+        p_final, p_s, p_t, _ = self._final_scores(memory, anchors, final_candidates)
 
-        p_z: Optional[torch.Tensor] = None
         if self.include_z_metrics and memory.z_bank is not None:
             z_candidates = self._candidate_indices(z_valid)
             if z_candidates.numel() > 1:
@@ -128,10 +141,6 @@ class RetrievalGraphPlanner:
                 self._mask_self(p_z_metric, anchors, z_candidates)
                 z_top_values, _ = _topk(p_z_metric, self.top_m)
                 metrics["planner_p_z_topm"] = _safe_mean(z_top_values)
-        if self.omega_z > 0:
-            p_z = self._component_sim(anchors, memory.z_bank, memory.z_bank, final_candidates)
-            self._mask_self(p_z, anchors, final_candidates)
-            p_final = p_final + self.omega_z * p_z
 
         s_top_values, s_top_local = _topk(p_s, self.top_m)
         t_top_values, t_top_local = _topk(p_t, self.top_m)
@@ -156,6 +165,64 @@ class RetrievalGraphPlanner:
         if label_precision is not None:
             metrics["planner_label_precision_topm"] = label_precision
         return metrics
+
+    @torch.no_grad()
+    def static_arf_targets(
+        self,
+        memory: PlannerMemoryBank,
+        anchor_indices: torch.Tensor,
+    ) -> Dict[str, torch.Tensor]:
+        """Build fixed-size Static ARF targets for a batch.
+
+        Returns indices and soft graph targets for S_i = N_i union R_i. The
+        union is represented as concatenation with a mask; duplicate samples do
+        not change the semantics materially and keep the implementation dense.
+        """
+
+        anchors = anchor_indices.detach().long().to(memory.device)
+        if memory.u_bank is None:
+            raise ValueError("Static ARF requires memory.u_bank; pass u_a/u_b to PlannerMemoryBank.update_batch.")
+        final_valid = memory.sem_dyn_valid & memory.u_valid
+        if self.omega_z > 0:
+            final_valid = final_valid & memory.z_valid
+        candidates = self._candidate_indices(final_valid)
+        if candidates.numel() <= 1:
+            empty_idx = torch.empty(anchors.shape[0], 0, dtype=torch.long, device=memory.device)
+            empty_val = torch.empty(anchors.shape[0], 0, dtype=torch.float32, device=memory.device)
+            empty_mask = torch.empty(anchors.shape[0], 0, dtype=torch.bool, device=memory.device)
+            return {"target_indices": empty_idx, "target_scores": empty_val, "target_mask": empty_mask}
+
+        p_final, _, _, _ = self._final_scores(memory, anchors, candidates)
+        top_values, top_local = _topk(p_final, self.top_m)
+        top_indices = candidates[top_local]
+        top_mask = torch.isfinite(top_values)
+
+        random_count = max(0, int(self.random_anchors))
+        if random_count > 0:
+            random_local = torch.randint(
+                low=0,
+                high=candidates.numel(),
+                size=(anchors.shape[0], random_count),
+                device=memory.device,
+            )
+            random_indices = candidates[random_local]
+            random_values = p_final.gather(dim=1, index=random_local)
+            random_mask = random_indices != anchors.unsqueeze(1)
+            random_mask = random_mask & torch.isfinite(random_values)
+            target_indices = torch.cat([top_indices, random_indices], dim=1)
+            target_scores = torch.cat([top_values, random_values], dim=1)
+            target_mask = torch.cat([top_mask, random_mask], dim=1)
+        else:
+            target_indices = top_indices
+            target_scores = top_values
+            target_mask = top_mask
+
+        target_scores = torch.clamp(torch.nan_to_num(target_scores, nan=0.0, posinf=0.0, neginf=0.0), 0.0, 1.0)
+        return {
+            "target_indices": target_indices,
+            "target_scores": target_scores,
+            "target_mask": target_mask,
+        }
 
     def _random_final_mean(
         self,

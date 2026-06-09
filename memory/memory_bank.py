@@ -59,18 +59,23 @@ class PlannerMemoryBank:
         device: torch.device,
         raw_dim: int = 0,
         z_dim: int = 0,
+        hash_dim: int = 0,
         z_momentum: float = 0.9,
+        u_momentum: float = 0.9,
         labels: Optional[torch.Tensor] = None,
     ):
         self.num_items = int(num_items)
         self.device = device
         self.z_momentum = float(z_momentum)
+        self.u_momentum = float(u_momentum)
         self.sem_proto_bank = self._empty_bank(raw_dim)
         self.dyn_proto_bank = self._empty_bank(raw_dim)
         self.z_bank = self._empty_bank(z_dim)
+        self.u_bank = self._empty_bank(hash_dim)
         self.sem_valid = torch.zeros(self.num_items, dtype=torch.bool, device=device)
         self.dyn_valid = torch.zeros(self.num_items, dtype=torch.bool, device=device)
         self.z_valid = torch.zeros(self.num_items, dtype=torch.bool, device=device)
+        self.u_valid = torch.zeros(self.num_items, dtype=torch.bool, device=device)
         self.update_count = torch.zeros(self.num_items, dtype=torch.long, device=device)
         self.last_epoch = torch.zeros(self.num_items, dtype=torch.long, device=device)
         self.labels = labels.to(device) if labels is not None else None
@@ -95,6 +100,12 @@ class PlannerMemoryBank:
         self.z_bank = torch.zeros(self.num_items, int(dim), dtype=torch.float32, device=self.device)
         self.z_valid.zero_()
 
+    def _ensure_u_dim(self, dim: int):
+        if self.u_bank is not None and self.u_bank.shape[1] == int(dim):
+            return
+        self.u_bank = torch.zeros(self.num_items, int(dim), dtype=torch.float32, device=self.device)
+        self.u_valid.zero_()
+
     @torch.no_grad()
     def update_batch(
         self,
@@ -104,6 +115,8 @@ class PlannerMemoryBank:
         z_a: torch.Tensor,
         z_b: torch.Tensor,
         epoch: int,
+        u_a: Optional[torch.Tensor] = None,
+        u_b: Optional[torch.Tensor] = None,
     ):
         indices = sample_indices.detach().long().to(self.device)
         raw = _flatten_temporal_features(video.detach()).to(self.device)
@@ -142,6 +155,19 @@ class PlannerMemoryBank:
             new_indices = indices[~old_valid]
             self.z_bank[new_indices] = z_proto[~old_valid]
         self.z_valid[indices] = True
+
+        if u_a is not None and u_b is not None:
+            self._ensure_u_dim(u_a.shape[-1])
+            u_proto = 0.5 * (u_a.detach().float().to(self.device) + u_b.detach().float().to(self.device))
+            old_u_valid = self.u_valid[indices]
+            if old_u_valid.any():
+                old_u_indices = indices[old_u_valid]
+                mixed_u = self.u_momentum * self.u_bank[old_u_indices] + (1.0 - self.u_momentum) * u_proto[old_u_valid]
+                self.u_bank[old_u_indices] = torch.clamp(mixed_u, min=-1.0, max=1.0)
+            if (~old_u_valid).any():
+                new_u_indices = indices[~old_u_valid]
+                self.u_bank[new_u_indices] = u_proto[~old_u_valid]
+            self.u_valid[indices] = True
 
         self.update_count[indices] += 1
         self.last_epoch[indices] = int(epoch)

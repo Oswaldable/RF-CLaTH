@@ -10,7 +10,7 @@ from torch.utils.data import DataLoader
 
 from datasets.video_dataset import build_dataloaders
 from engine.evaluate import evaluate_retrieval
-from losses import RFClathLoss
+from losses import RFClathLoss, StaticARFLoss
 from memory import PlannerMemoryBank, build_label_bank
 from models import RetrievalFeedbackContentLateralTemporalHashing
 from planner import RetrievalGraphPlanner
@@ -48,6 +48,18 @@ def build_scheduler(optimizer, cfg: Dict):
         return 0.5 * (1.0 + math.cos(math.pi * progress))
 
     return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_lambda)
+
+
+def build_criterion(cfg: Dict) -> nn.Module:
+    objective = str(
+        cfg.get("training", {}).get(
+            "objective",
+            cfg.get("train", {}).get("objective", cfg.get("loss", {}).get("type", "rf_clath")),
+        )
+    ).lower()
+    if objective in {"static_arf", "arf_static"}:
+        return StaticARFLoss(cfg)
+    return RFClathLoss(cfg)
 
 
 def format_retrieval_metrics(metrics: Dict[str, float], topk, map_topk=None) -> str:
@@ -111,6 +123,20 @@ def train_one_epoch(
             outputs["epoch"] = torch.tensor(epoch, device=device)
             if neighbor_indices is not None:
                 outputs["neighbor_indices"] = neighbor_indices[batch_indices_cpu].to(device, non_blocking=True)
+            if planner_memory is not None and graph_planner is not None:
+                with torch.no_grad():
+                    planner_memory.update_batch(
+                        batch_indices_cpu,
+                        video.detach(),
+                        outputs["selected_indices"].detach(),
+                        outputs["z_a"].detach(),
+                        outputs["z_b"].detach(),
+                        epoch=epoch,
+                        u_a=outputs["u_a"].detach(),
+                        u_b=outputs["u_b"].detach(),
+                    )
+                outputs["planner_memory"] = planner_memory
+                outputs["graph_planner"] = graph_planner
             losses = criterion(outputs)
             loss = losses["loss"]
         scaler.scale(loss).backward()
@@ -123,14 +149,6 @@ def train_one_epoch(
         planner_metrics = None
         if planner_memory is not None and graph_planner is not None:
             with torch.no_grad():
-                planner_memory.update_batch(
-                    batch_indices_cpu,
-                    video.detach(),
-                    outputs["selected_indices"].detach(),
-                    outputs["z_a"].detach(),
-                    outputs["z_b"].detach(),
-                    epoch=epoch,
-                )
                 planner_should_log = (
                     step % planner_log_interval == 0
                     or step == len(dataloader)
@@ -174,7 +192,8 @@ def train_one_epoch(
             metric_count += 1
             logger.info(
                 "epoch=%d step=%d/%d loss=%.4f view=%.4f semantic=%.4f hash=%.4f "
-                "view_raw=%.4f batch_neigh=%.4f mem_neigh=%.4f quant=%.4f bit_bal=%.4f "
+                "view_raw=%.4f batch_neigh=%.4f mem_neigh=%.4f arf_raw=%.4f "
+                "quant=%.4f bit_bal=%.4f arf_targets=%.1f arf_target=%.3f "
                 "agree=%.3f hamm=%.3f entropy=%.3f bit_use=%.3f sat=%.3f mask=%.3f fast_cos=%.3f",
                 epoch,
                 step,
@@ -186,8 +205,11 @@ def train_one_epoch(
                 float(losses["component_view_contrast"].detach().cpu()),
                 float(losses["component_batch_neighbor"].detach().cpu()),
                 float(losses["component_memory_neighbor"].detach().cpu()),
+                float(losses.get("component_arf_static", torch.zeros((), device=device)).detach().cpu()),
                 float(losses["component_quant"].detach().cpu()),
                 float(losses["component_bit_balance"].detach().cpu()),
+                float(losses.get("metric_arf_target_count", torch.zeros((), device=device)).detach().cpu()),
+                float(losses.get("metric_arf_target_mean", torch.zeros((), device=device)).detach().cpu()),
                 hash_metrics["metric_hash_agree"],
                 hash_metrics["metric_hamm_norm"],
                 hash_metrics["metric_bit_entropy"],
@@ -227,7 +249,8 @@ def train_one_epoch(
         )
     logger.info(
         "epoch=%d train_time=%.1fs loss=%.4f view=%.4f semantic=%.4f hash=%.4f "
-        "view_raw=%.4f batch_neigh=%.4f mem_neigh=%.4f quant=%.4f bit_bal=%.4f "
+        "view_raw=%.4f batch_neigh=%.4f mem_neigh=%.4f arf_raw=%.4f "
+        "quant=%.4f bit_bal=%.4f arf_targets=%.1f arf_target=%.3f "
         "agree=%.3f hamm=%.3f entropy=%.3f bit_use=%.3f balance_abs=%.3f sat=%.3f std=%.3f pos=%.3f mask=%.3f fast_cos=%.3f fused_cos=%.3f",
         epoch,
         time.time() - start,
@@ -238,8 +261,11 @@ def train_one_epoch(
         averaged.get("component_view_contrast", 0.0),
         averaged.get("component_batch_neighbor", 0.0),
         averaged.get("component_memory_neighbor", 0.0),
+        averaged.get("component_arf_static", 0.0),
         averaged.get("component_quant", 0.0),
         averaged.get("component_bit_balance", 0.0),
+        averaged.get("metric_arf_target_count", 0.0),
+        averaged.get("metric_arf_target_mean", 0.0),
         averaged.get("metric_hash_agree", 0.0),
         averaged.get("metric_hamm_norm", 0.0),
         averaged.get("metric_bit_entropy", 0.0),
@@ -356,7 +382,7 @@ def train_rf_clath(
     model = RetrievalFeedbackContentLateralTemporalHashing(cfg).to(use_device)
     if "loss" in cfg and "memory_neighbor" in cfg["loss"]:
         cfg["loss"]["memory_neighbor"]["num_items"] = len(train_loader.dataset)
-    criterion = RFClathLoss(cfg).to(use_device)
+    criterion = build_criterion(cfg).to(use_device)
     planner_memory = None
     graph_planner = None
     planner_cfg = cfg.get("planner", {})
@@ -376,7 +402,9 @@ def train_rf_clath(
             if cfg.get("model", {}).get("input_type", "features") == "features"
             else 0,
             z_dim=int(cfg.get("model", {}).get("hidden_dim", 0)),
+            hash_dim=int(cfg.get("model", {}).get("hash_bits", 0)),
             z_momentum=float(planner_cfg.get("z_momentum", 0.9)),
+            u_momentum=float(planner_cfg.get("u_momentum", planner_cfg.get("z_momentum", 0.9))),
             labels=labels,
         )
         graph_planner = RetrievalGraphPlanner.from_config(planner_cfg)
