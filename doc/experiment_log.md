@@ -64,3 +64,29 @@ note: previous mistaken s5vh_hmdb queue was stopped at epoch 2 and is not used f
 | 16 | /mnt/disk2/yql/RF-CLaTH_outputs/rf_clath_t_sas_hmdb_disk2/hmdb_16b_20260608_142727 | /mnt/disk2/yql/RF-CLaTH_outputs/rf_clath_t_sas_hmdb_disk2/hmdb_16b_20260608_142727/best.pth | 65 | 0.3125 | 0.2342 | 0.1826 | 0.1457 | 0.1183 | 0.0994 | 0.3702 | 0.3117 | 0.1719 | 0.0247 | 0.0831 | 0.2292 | completed; final epoch 150 mAP@100=0.0952 |
 | 32 | /mnt/disk2/yql/RF-CLaTH_outputs/rf_clath_t_sas_hmdb_disk2/hmdb_32b_20260608_182721 | /mnt/disk2/yql/RF-CLaTH_outputs/rf_clath_t_sas_hmdb_disk2/hmdb_32b_20260608_182721/best.pth | 100 | 0.3678 | 0.2693 | 0.2084 | 0.1656 | 0.1352 | 0.1134 | 0.4238 | 0.3460 | 0.1893 | 0.0283 | 0.0923 | 0.2523 | completed; final epoch 150 mAP@100=0.1122 |
 | 64 | /mnt/disk2/yql/RF-CLaTH_outputs/rf_clath_t_sas_hmdb_disk2/hmdb_64b_20260608_212823 | /mnt/disk2/yql/RF-CLaTH_outputs/rf_clath_t_sas_hmdb_disk2/hmdb_64b_20260608_212823/best.pth | 100 | 0.4118 | 0.2923 | 0.2289 | 0.1839 | 0.1512 | 0.1273 | 0.4569 | 0.3622 | 0.2063 | 0.0305 | 0.0966 | 0.2751 | completed; final epoch 150 mAP@100=0.1257 |
+
+### HMDB51 Trainable Selector 16/32/64-bit
+
+```text
+dataset: hmdb
+config: configs/rf_clath_hmdb_trainable.yaml
+method: RF-CLaTH + trainable segment_rerank_gumbel_topk selector + original RF-CLaTH loss
+gpu: cuda2
+bits: 16, 32, 64
+execution: serial within one queue
+remote output root: /mnt/disk2/yql/RF-CLaTH_outputs/rf_clath_trainable_hmdb_disk2
+launcher pid: 2985206
+active train pid: 2985228
+remote launcher log: /mnt/disk2/yql/RF-CLaTH_run_logs/rf_clath_trainable_hmdb_cuda2_launcher_20260609_003938.log
+remote queue log: /mnt/disk2/yql/RF-CLaTH_run_logs/rf_clath_trainable_hmdb_disk2_20260609_003938.queue.log
+status: running 16-bit
+note: this is a selector ablation against the completed HMDB T-SAS runs above.
+```
+
+结果记录：
+
+| Bits | Run Dir | Best Checkpoint | Selected Epoch | mAP@5 | mAP@20 | mAP@40 | mAP@60 | mAP@80 | mAP@100 | P@5 | P@20 | P@100 | R@5 | R@20 | R@100 | Notes |
+|---:|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|
+| 16 | /mnt/disk2/yql/RF-CLaTH_outputs/rf_clath_trainable_hmdb_disk2/hmdb_16b_20260609_003941 | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD | running |
+| 32 | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD | queued |
+| 64 | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD | queued |

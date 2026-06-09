@@ -1,0 +1,149 @@
+project:
+  name: RF-CLaTH-TrainableSelector-HMDB-RePartition
+  output_dir: ./outputs/rf_clath_trainable_hmdb
+  seed: 3346
+
+data:
+  name: hmdb
+  cache_in_memory: false
+  num_workers: 8
+  pin_memory: true
+  datasets:
+    hmdb:
+      dataset: hmdb
+      format: s5vh_h5
+      num_classes: 51
+      feature_key: feats
+      train_feature_path: /mnt/disk2/yql/dataset_rePartition/hmdb/hmdb_train_feats.h5
+      val_feature_path: /mnt/disk2/yql/dataset_rePartition/hmdb/hmdb_test_feats.h5
+      test_feature_path: /mnt/disk2/yql/dataset_rePartition/hmdb/hmdb_test_feats.h5
+      retrieval_feature_path: /mnt/disk2/yql/dataset_rePartition/hmdb/hmdb_train_feats.h5
+      train_label_path: ./cache/repartition_s5vh_hmdb_train_label.pt
+      val_label_path: ./cache/repartition_s5vh_hmdb_q_label.pt
+      test_label_path: ./cache/repartition_s5vh_hmdb_q_label.pt
+      retrieval_label_path: ./cache/repartition_s5vh_hmdb_re_label.pt
+
+model:
+  input_type: features
+  num_frames: 25
+  num_keyframes: 5
+  feature_dim: 4096
+  hidden_dim: 512
+  hash_bits: 64
+
+  frame_backbone:
+    type: resnet50
+    pretrained: false
+
+  keyframe_selector:
+    strategy: segment_rerank_gumbel_topk
+    trainable: true
+    feature_source: projected
+    segment_size: 5
+    temperature: 1.0
+    share_key_idx_across_views: true
+
+  slow_encoder:
+    type: selected_class_attention
+    token_layers: 2
+    class_layers: 2
+    num_queries: 2
+    num_heads: 8
+    mlp_ratio: 2.0
+    dropout: 0.1
+    pooling: attention
+    use_residual_gate: true
+
+  fast_encoder:
+    type: bidirectional_mamba
+    input_frames: all
+    depth: 2
+    d_state: 16
+    d_conv: 4
+    expand: 2
+    pooling: mean
+    use_official_mamba: true
+    strict_official_mamba: true
+
+  mask_aug:
+    mask_ratio: 0.2
+    use_temporal_jitter: true
+    use_frame_dropout: true
+    frame_dropout_ratio: 0.05
+    use_motion_aware_mask: false
+    mask_motion: low
+
+  fusion:
+    type: content_time_lateral
+    dropout: 0.1
+    lateral_temperature: 2.0
+    content_temperature: 0.5
+    num_time_buckets: 30
+    lateral_gamma_init: 0.1
+
+ablation:
+  use_slow_branch: true
+  use_fast_branch: true
+  use_keyframe_selector: true
+  use_mask_aug: true
+  use_hash_con: true
+  slow_encoder_type: selected_class_attention
+  fast_encoder_type: bidirectional_mamba
+
+loss:
+  view:
+    lambda: 0.3
+  semantic:
+    lambda_batch_neighbor: 0.5
+    lambda_memory_neighbor: 0.04
+  hash:
+    lambda_quant: 0.02
+    lambda_bit_balance: 0.03
+  temperature: 0.2
+  neighbor_temperature: 0.2
+  symmetric_neighbors: true
+
+  memory_neighbor:
+    num_items: 0
+    start_epoch: 2
+    temperature: 0.2
+    momentum: 0.9
+    positives_per_anchor: 15
+    include_self: false
+
+neighbor:
+  enabled: true
+  topk: 20
+  neighbors_per_anchor: 1
+  feature_batch_size: 256
+  sim_chunk_size: 512
+  build_on_cuda: true
+  cache: true
+  cache_path: ./cache/repartition_hmdb_train_rawmean_top20.pt
+  label_precision_probe: 0
+
+train:
+  batch_size: 256
+  epochs: 150
+  optimizer: adamw
+  lr: 3e-5
+  weight_decay: 1e-4
+  warmup_epochs: 10
+  amp: true
+  grad_clip: 5.0
+  log_interval: 20
+  eval_interval: 5
+  save_interval: 5
+  max_steps_per_epoch: 0
+  early_stop_patience: 0
+  early_stop_min_delta: 0.0
+  resume: ""
+
+eval:
+  split: test
+  batch_size: 256
+  topk: [5, 10, 20, 40, 60, 80, 100]
+  map_topk: [5, 20, 40, 60, 80, 100]
+  gmap_topk: []
+  hash_bits: [16, 32, 64]
+  binary_format: pm1
