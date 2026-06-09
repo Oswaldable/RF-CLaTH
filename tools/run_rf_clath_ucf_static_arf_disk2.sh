@@ -31,7 +31,7 @@ run_ucf() {
       --output-dir "$OUTPUT_DIR" \
       --epochs 150 \
       --hash-bits "$bits" \
-      --override "project.name=RF-CLaTH-StaticARF-Tuned-UCF-RePartition"
+      --override "project.name=RF-CLaTH-StaticARF-LR1e-4-UCF-RePartition"
   done
 
   echo "$(timestamp) | rf_clath_static_arf_ucf done"

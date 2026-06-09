@@ -31,7 +31,7 @@ run_hmdb() {
       --output-dir "$OUTPUT_DIR" \
       --epochs 150 \
       --hash-bits "$bits" \
-      --override "project.name=RF-CLaTH-StaticARF-Tuned-HMDB-RePartition"
+      --override "project.name=RF-CLaTH-StaticARF-LR1e-4-HMDB-RePartition"
   done
 
   echo "$(timestamp) | rf_clath_static_arf_hmdb done"

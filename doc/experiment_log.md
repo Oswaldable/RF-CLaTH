@@ -247,3 +247,173 @@ HMDB:
 |---|---:|---|---:|---:|---:|---:|---:|---:|---:|---|
 | UCF101 | 16 | epoch 1 step 20/39 | 0.6628 | 0.6213 | 0.0415 | 0.658 | 0.8228 | 0.5737 | 0.519 | running |
 | HMDB51 | 16 | epoch 1 step 14/14 | 0.6952 | 0.6510 | 0.0442 | 0.617 | 0.7688 | 0.5406 | 0.317 | running |
+
+## 2026-06-09 Stage3 Static ARF Tuned Restart
+
+触发原因：
+
+```text
+初版 Static ARF early metrics 明显偏低：
+  UCF16 best observed mAP@100=0.1048 at epoch 15
+  HMDB16 best observed mAP@100=0.0322 at epoch 30
+
+主要问题不是 hash collapse：
+  bit entropy/bit_use 正常
+  planner P_final_topM > P_random
+
+更可能的问题：
+  Static ARF target 过软，random anchors 的 P_ij 也偏高；
+  random anchors 没有形成足够排斥力；
+  UCF16 soft saturation 下滑，quant 不够强。
+```
+
+停止旧队列：
+
+```text
+stopped:
+  UCF Static ARF launcher pid 1456162
+  UCF Static ARF trainer pid 1456173
+  HMDB Static ARF launcher pid 1456319
+  HMDB Static ARF trainer pid 1456384
+```
+
+参数调整：
+
+| Parameter | Old | New | Reason |
+|---|---:|---:|---|
+| arf_loss.gamma | 8 | 6 | 降低早期 logits 压力，减少软目标拟合震荡 |
+| loss_weights.lambda_quant | 0.10 | 0.20 | 抑制 UCF soft saturation 下滑 |
+| loss_weights.lambda_balance | 0.05 | 0.10 | 更强 bit balance，防止新损失下 bit 偏移 |
+| planner.top_m | 20 | 10 | 使用更高置信 planned neighbors |
+| planner.random_anchors | 40 | 20 | 降低中等相似 random anchors 对 BCE 的牵引 |
+| planner.u_momentum | 0.9 | 0.5 | 降低早期坏 soft code 在 u_bank 中的滞留 |
+
+新队列：
+
+```text
+UCF:
+  gpu: cuda0
+  launcher pid: 1660464
+  trainer pid: 1660474
+  queue log: /mnt/disk2/yql/RF-CLaTH_run_logs/rf_clath_static_arf_ucf_disk2_20260609_112131.queue.log
+  active first run: /mnt/disk2/yql/RF-CLaTH_outputs/rf_clath_static_arf_ucf_disk2/s5vh_ucf_16b_20260609_112135
+
+HMDB:
+  gpu: cuda2
+  launcher pid: 1660480
+  trainer pid: 1660491
+  queue log: /mnt/disk2/yql/RF-CLaTH_run_logs/rf_clath_static_arf_hmdb_disk2_20260609_112131.queue.log
+  active first run: /mnt/disk2/yql/RF-CLaTH_outputs/rf_clath_static_arf_hmdb_disk2/hmdb_16b_20260609_112135
+```
+
+已确认 tuned 参数生效：
+
+| Dataset | Bit | Epoch | top_m | random_anchors | target count | target mean | P final topM | P random | label precision | sat | entropy | bit_use | Notes |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|
+| UCF101 | 16 | 1 | 10 | 20 | 30.0 | 0.661 | 0.8568 | 0.5738 | 0.683 | 0.521 | 0.795 | 0.969 | running; first eval pending |
+| HMDB51 | 16 | 4 | 10 | 20 | 30.0 | 0.625 | 0.7959 | 0.5424 | 0.429 | 0.612 | 0.930 | 1.000 | running; first eval pending |
+
+备注：
+
+```text
+2026-06-09 11:25 左右远端 SSH/rsync 多次在握手阶段 reset。
+训练进程已确认启动，epoch5 eval 暂未成功拉取。
+后续需要继续同步 train.log，重点看 tuned 后 mAP@100 是否超过初版 epoch5：
+  UCF16 old epoch5 mAP@100=0.0821
+  HMDB16 old epoch5 mAP@100=0.0271
+```
+
+后续远端检查：
+
+| Dataset | Bit | Tuned Epoch | mAP@5 | mAP@20 | mAP@40 | mAP@60 | mAP@80 | mAP@100 | P@5 | P@20 | P@100 | Old Static ARF Reference | Status |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|---|
+| UCF101 | 16 | 5 | 0.2475 | 0.1532 | 0.1128 | 0.0920 | 0.0795 | 0.0709 | 0.3210 | 0.2467 | 0.1585 | old epoch5 mAP@100=0.0821 | worse |
+| UCF101 | 16 | 10 | 0.2586 | 0.1595 | 0.1184 | 0.0990 | 0.0864 | 0.0767 | 0.3299 | 0.2525 | 0.1671 | old epoch10 mAP@100=0.0884 | worse |
+| UCF101 | 16 | 15 | 0.2335 | 0.1442 | 0.1078 | 0.0890 | 0.0772 | 0.0677 | 0.3069 | 0.2401 | 0.1566 | old epoch15 mAP@100=0.1048 | worse |
+| HMDB51 | 16 | 5 | 0.1079 | 0.0584 | 0.0403 | 0.0326 | 0.0279 | 0.0246 | 0.1562 | 0.1299 | 0.0924 | old epoch5 mAP@100=0.0271 | worse |
+| HMDB51 | 16 | 10 | 0.1240 | 0.0665 | 0.0458 | 0.0365 | 0.0311 | 0.0274 | 0.1805 | 0.1431 | 0.0985 | old epoch10 mAP@100=0.0285 | slightly worse |
+| HMDB51 | 16 | 15 | 0.1224 | 0.0676 | 0.0467 | 0.0378 | 0.0320 | 0.0279 | 0.1738 | 0.1415 | 0.0966 | old epoch15 mAP@100=0.0284 | slightly worse |
+| HMDB51 | 16 | 20 | 0.1151 | 0.0591 | 0.0400 | 0.0318 | 0.0270 | 0.0235 | 0.1663 | 0.1308 | 0.0918 | old epoch20 mAP@100=0.0320 | worse |
+
+最新训练健康指标：
+
+| Dataset | Epoch | target count | target mean | P final topM | P random | label precision | quant | bit balance | sat | entropy | bit_use | Conclusion |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|
+| UCF101 | 16 | 30.0 | 0.672 | 0.8719 | 0.5742 | 0.735 | 0.1195 | 0.0512 | 0.783 | 0.918 | 0.938 | hash healthier but retrieval worse |
+| HMDB51 | 21 | 30.0 | 0.624 | 0.7948 | 0.5400 | 0.409 | 0.1662 | 0.0262 | 0.717 | 0.984 | 1.000 | hash healthy but retrieval worse |
+
+结论：
+
+```text
+Tuned Static ARF 参数失败。
+更强 quant/balance 和更窄 top_m 没有修复检索，反而让 UCF/HMDB 的 early mAP 更低。
+这说明当前主要问题不是二值化强度，而是 Static ARF 的 target calibration / target semantics。
+planner graph 自身仍有区分度，但 BCE 拟合 P_ij 不能有效转化为 Hamming ranking。
+继续跑 tuned 三 bits 的价值较低。
+```
+
+## 2026-06-09 Stage3 Static ARF LR1e-4 16-bit Restart
+
+目的：
+
+```text
+恢复旧 Static ARF 参数，只提高学习率，看 16-bit 最终是否能明显好于低学习率版本。
+不进入阶段4，不加回 view/contrastive/neighbor。
+```
+
+恢复/调整参数：
+
+| Parameter | Value |
+|---|---:|
+| arf_loss.gamma | 8 |
+| loss_weights.lambda_quant | 0.10 |
+| loss_weights.lambda_balance | 0.05 |
+| planner.top_m | 20 |
+| planner.random_anchors | 40 |
+| planner.u_momentum | 0.9 |
+| train.lr | 1e-4 |
+| bits | 16 only |
+
+停止 tuned 队列：
+
+```text
+stopped:
+  UCF tuned launcher pid 1660464
+  UCF tuned trainer pid 1660474
+  HMDB tuned launcher pid 1660480
+  HMDB tuned trainer pid 1660491
+```
+
+新队列：
+
+```text
+UCF:
+  gpu: cuda0
+  launcher pid: 1810249
+  trainer pid: 1810274
+  queue log: /mnt/disk2/yql/RF-CLaTH_run_logs/rf_clath_static_arf_ucf_disk2_20260609_114307.queue.log
+  run: /mnt/disk2/yql/RF-CLaTH_outputs/rf_clath_static_arf_ucf_disk2/s5vh_ucf_16b_20260609_114312
+
+HMDB:
+  gpu: cuda2
+  launcher pid: 1810248
+  trainer pid: 1810273
+  queue log: /mnt/disk2/yql/RF-CLaTH_run_logs/rf_clath_static_arf_hmdb_disk2_20260609_114307.queue.log
+  run: /mnt/disk2/yql/RF-CLaTH_outputs/rf_clath_static_arf_hmdb_disk2/hmdb_16b_20260609_114312
+```
+
+验证：
+
+```text
+saved config confirmed:
+  hash_bits=16
+  lr=1e-4
+  top_m=20
+  random_anchors=40
+  gamma=8
+  lambda_quant=0.10
+  lambda_balance=0.05
+
+queue log confirmed:
+  BITS=16 only
+```
