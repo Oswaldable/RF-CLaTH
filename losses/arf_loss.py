@@ -6,6 +6,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+from .contrastive import HashContrastiveLoss, NeighborHashContrastiveLoss
 from .hash_losses import BalanceLoss, QuantizationLoss
 
 
@@ -341,4 +342,66 @@ class ARFLoss(StaticARFLoss):
             "metric_arf_omega_z": torch.tensor(float(schedule["omega_z"]), device=device),
             "metric_arf_gamma": torch.tensor(float(schedule["gamma"]), device=device),
             "metric_arf_lambda_quant": torch.tensor(float(schedule["lambda_quant"]), device=device),
+        }
+
+
+class HybridARFLoss(ARFLoss):
+    """Stage1 contrastive objective with ARF replacing memory-neighbor supervision."""
+
+    requires_planner_memory = True
+
+    def __init__(self, cfg: Dict):
+        super().__init__(cfg)
+        loss_cfg = cfg.get("loss", {})
+        temperature = float(loss_cfg.get("temperature", 0.2))
+        self.lambda_view = _get_float(
+            loss_cfg,
+            (("view", "lambda"), ("consistency", "lambda"), ("lambda_consistency",), ("lambda_hash_con",)),
+            0.3,
+        )
+        self.lambda_batch_neighbor = _get_float(
+            loss_cfg,
+            (("semantic", "lambda_batch_neighbor"), ("lambda_neighbor_con",)),
+            0.5,
+        )
+        self.hash_contrast = HashContrastiveLoss(temperature=temperature)
+        self.neighbor_hash_contrast = NeighborHashContrastiveLoss(
+            temperature=float(loss_cfg.get("neighbor_temperature", temperature)),
+            symmetric_neighbors=bool(loss_cfg.get("symmetric_neighbors", True)),
+        )
+
+    def forward(self, outputs: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+        losses = super().forward(outputs)
+        device = outputs["u_a"].device
+        zero = torch.zeros((), device=device)
+
+        component_view = zero
+        if self.lambda_view > 0:
+            component_view = self.hash_contrast(outputs["u_a"], outputs["u_b"])
+
+        component_batch_neighbor = zero
+        has_neighbors = "sample_indices" in outputs and "neighbor_indices" in outputs
+        if self.lambda_batch_neighbor > 0 and has_neighbors:
+            component_batch_neighbor = self.neighbor_hash_contrast(
+                outputs["u_a"],
+                outputs["u_b"],
+                outputs["sample_indices"],
+                outputs["neighbor_indices"],
+            )
+
+        loss_view = self.lambda_view * component_view
+        loss_batch_neighbor = self.lambda_batch_neighbor * component_batch_neighbor
+        loss_arf = losses["loss_arf"]
+        loss_semantic = loss_batch_neighbor + loss_arf
+        total = loss_view + loss_semantic + losses["loss_hash"]
+
+        return {
+            **losses,
+            "component_view_contrast": component_view,
+            "component_batch_neighbor": component_batch_neighbor,
+            "component_memory_neighbor": zero,
+            "loss_view": loss_view,
+            "loss_semantic": loss_semantic,
+            "loss_arf": loss_arf,
+            "loss": total,
         }

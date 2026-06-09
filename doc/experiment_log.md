@@ -537,3 +537,37 @@ Sanity 结果：
 | Dataset | Bit | Steps | loss | L_ARF raw | L_hash | target count | target mean | actual overlap | false ratio | missed ratio | retrieved target | feedback weight | eta_m | eta_f | omega_z | gamma | P final topM | P random | Notes |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|
 | HMDB51 | 16 | 2 | 0.9948 | 0.8979 | 0.0969 | 79.9 | 0.567 | 0.165 | 0.835 | 0.729 | 0.564 | 1.265 | 1.0 | 1.0 | 0.30 | 10.0 | 0.6930 | 0.5121 | passed; actual trace and P_z active |
+
+## 2026-06-09 Stage5 Full ARF 16-bit Official Launch
+
+目的：按阶段5 Full ARF 方案正式验证 16-bit，不启用 32/64b，先看 UCF/HMDB 是否能走出 Static ARF 的低 mAP 问题。
+
+当前学习率：
+
+```text
+configs/rf_clath_ucf_full_arf.yaml:  train.lr = 3e-5
+configs/rf_clath_hmdb_full_arf.yaml: train.lr = 3e-5
+```
+
+说明：`1e-4` 只用于前一轮 Static ARF 诊断实验；Full ARF 正式启动回到主方法一致的 `3e-5`。
+
+启动任务：
+
+| Dataset | Bit | GPU | Status | Launcher PID | Train Dir | Launcher Log | Queue Log |
+|---|---:|---:|---|---:|---|---|---|
+| UCF101 | 16 | cuda0 | running | 2297060 | `/mnt/disk2/yql/RF-CLaTH_outputs/rf_clath_full_arf_ucf_disk2/s5vh_ucf_16b_20260609_131518` | `/mnt/disk2/yql/RF-CLaTH_run_logs/rf_clath_full_arf_ucf16_cuda0_launcher_20260609_131514.log` | `/mnt/disk2/yql/RF-CLaTH_run_logs/rf_clath_full_arf_ucf_disk2_20260609_131514.queue.log` |
+| HMDB51 | 16 | cuda2 | running | 2298870 | `/mnt/disk2/yql/RF-CLaTH_outputs/rf_clath_full_arf_hmdb_disk2/hmdb_16b_20260609_131532` | `/mnt/disk2/yql/RF-CLaTH_run_logs/rf_clath_full_arf_hmdb16_cuda2_launcher_20260609_131528.log` | `/mnt/disk2/yql/RF-CLaTH_run_logs/rf_clath_full_arf_hmdb_disk2_20260609_131529.queue.log` |
+
+待观察指标：
+
+```text
+hash / quant / balance:
+  判断哈希层是否仍然正常学习
+
+arf_overlap / arf_false / arf_missed / arf_retrieved / arf_weight:
+  判断 actual retrieval trace 是否真的进入训练反馈
+
+mAP@100:
+  UCF16 先对比 Stage1 T-SAS best 0.3434
+  HMDB16 先对比 Stage1 T-SAS best 0.0994
+```

@@ -10,7 +10,7 @@ from torch.utils.data import DataLoader
 
 from datasets.video_dataset import build_dataloaders
 from engine.evaluate import evaluate_retrieval
-from losses import ARFLoss, RFClathLoss, StaticARFLoss
+from losses import ARFLoss, HybridARFLoss, RFClathLoss, StaticARFLoss
 from memory import PlannerMemoryBank, build_label_bank
 from models import RetrievalFeedbackContentLateralTemporalHashing
 from planner import RetrievalGraphPlanner
@@ -61,6 +61,8 @@ def build_criterion(cfg: Dict) -> nn.Module:
         return StaticARFLoss(cfg)
     if objective in {"arf", "full_arf", "trace_arf"}:
         return ARFLoss(cfg)
+    if objective in {"hybrid_arf", "arf_hybrid", "contrastive_arf"}:
+        return HybridARFLoss(cfg)
     return RFClathLoss(cfg)
 
 
