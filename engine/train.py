@@ -10,7 +10,7 @@ from torch.utils.data import DataLoader
 
 from datasets.video_dataset import build_dataloaders
 from engine.evaluate import evaluate_retrieval
-from losses import RFClathLoss, StaticARFLoss
+from losses import ARFLoss, RFClathLoss, StaticARFLoss
 from memory import PlannerMemoryBank, build_label_bank
 from models import RetrievalFeedbackContentLateralTemporalHashing
 from planner import RetrievalGraphPlanner
@@ -59,6 +59,8 @@ def build_criterion(cfg: Dict) -> nn.Module:
     ).lower()
     if objective in {"static_arf", "arf_static"}:
         return StaticARFLoss(cfg)
+    if objective in {"arf", "full_arf", "trace_arf"}:
+        return ARFLoss(cfg)
     return RFClathLoss(cfg)
 
 
@@ -194,6 +196,8 @@ def train_one_epoch(
                 "epoch=%d step=%d/%d loss=%.4f view=%.4f semantic=%.4f hash=%.4f "
                 "view_raw=%.4f batch_neigh=%.4f mem_neigh=%.4f arf_raw=%.4f "
                 "quant=%.4f bit_bal=%.4f arf_targets=%.1f arf_target=%.3f "
+                "arf_overlap=%.3f arf_false=%.3f arf_missed=%.3f arf_retrieved=%.3f "
+                "arf_weight=%.3f eta_m=%.3f eta_f=%.3f omega_z=%.3f arf_gamma=%.1f "
                 "agree=%.3f hamm=%.3f entropy=%.3f bit_use=%.3f sat=%.3f mask=%.3f fast_cos=%.3f",
                 epoch,
                 step,
@@ -210,6 +214,15 @@ def train_one_epoch(
                 float(losses["component_bit_balance"].detach().cpu()),
                 float(losses.get("metric_arf_target_count", torch.zeros((), device=device)).detach().cpu()),
                 float(losses.get("metric_arf_target_mean", torch.zeros((), device=device)).detach().cpu()),
+                float(losses.get("metric_arf_actual_overlap", torch.zeros((), device=device)).detach().cpu()),
+                float(losses.get("metric_arf_false_ratio", torch.zeros((), device=device)).detach().cpu()),
+                float(losses.get("metric_arf_missed_ratio", torch.zeros((), device=device)).detach().cpu()),
+                float(losses.get("metric_arf_retrieved_target_mean", torch.zeros((), device=device)).detach().cpu()),
+                float(losses.get("metric_arf_feedback_weight_mean", torch.zeros((), device=device)).detach().cpu()),
+                float(losses.get("metric_arf_eta_missed", torch.zeros((), device=device)).detach().cpu()),
+                float(losses.get("metric_arf_eta_false", torch.zeros((), device=device)).detach().cpu()),
+                float(losses.get("metric_arf_omega_z", torch.zeros((), device=device)).detach().cpu()),
+                float(losses.get("metric_arf_gamma", torch.zeros((), device=device)).detach().cpu()),
                 hash_metrics["metric_hash_agree"],
                 hash_metrics["metric_hamm_norm"],
                 hash_metrics["metric_bit_entropy"],
@@ -251,6 +264,8 @@ def train_one_epoch(
         "epoch=%d train_time=%.1fs loss=%.4f view=%.4f semantic=%.4f hash=%.4f "
         "view_raw=%.4f batch_neigh=%.4f mem_neigh=%.4f arf_raw=%.4f "
         "quant=%.4f bit_bal=%.4f arf_targets=%.1f arf_target=%.3f "
+        "arf_overlap=%.3f arf_false=%.3f arf_missed=%.3f arf_retrieved=%.3f "
+        "arf_weight=%.3f eta_m=%.3f eta_f=%.3f omega_z=%.3f arf_gamma=%.1f "
         "agree=%.3f hamm=%.3f entropy=%.3f bit_use=%.3f balance_abs=%.3f sat=%.3f std=%.3f pos=%.3f mask=%.3f fast_cos=%.3f fused_cos=%.3f",
         epoch,
         time.time() - start,
@@ -266,6 +281,15 @@ def train_one_epoch(
         averaged.get("component_bit_balance", 0.0),
         averaged.get("metric_arf_target_count", 0.0),
         averaged.get("metric_arf_target_mean", 0.0),
+        averaged.get("metric_arf_actual_overlap", 0.0),
+        averaged.get("metric_arf_false_ratio", 0.0),
+        averaged.get("metric_arf_missed_ratio", 0.0),
+        averaged.get("metric_arf_retrieved_target_mean", 0.0),
+        averaged.get("metric_arf_feedback_weight_mean", 0.0),
+        averaged.get("metric_arf_eta_missed", 0.0),
+        averaged.get("metric_arf_eta_false", 0.0),
+        averaged.get("metric_arf_omega_z", 0.0),
+        averaged.get("metric_arf_gamma", 0.0),
         averaged.get("metric_hash_agree", 0.0),
         averaged.get("metric_hamm_norm", 0.0),
         averaged.get("metric_bit_entropy", 0.0),

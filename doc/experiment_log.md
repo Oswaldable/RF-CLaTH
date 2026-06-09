@@ -417,3 +417,123 @@ saved config confirmed:
 queue log confirmed:
   BITS=16 only
 ```
+
+## 2026-06-09 Stage5 Full ARF Implementation
+
+用户指令：
+
+```text
+停止当前两个 Static ARF LR1e-4 进程，直接实现阶段5。
+```
+
+已停止：
+
+```text
+UCF Static ARF LR1e-4:
+  launcher pid 1810249
+  trainer pid 1810274
+
+HMDB Static ARF LR1e-4:
+  launcher pid 1810248
+  trainer pid 1810273
+```
+
+实现范围：
+
+```text
+objective: arf / full_arf / trace_arf
+loss:
+  L = L_ARF + lambda_quant L_quant + lambda_balance L_balance
+
+enabled:
+  actual retrieval trace A_i
+  missed-neighbor feedback
+  false-retrieval feedback
+  P_z fused memory graph
+  graph warmup schedule
+  feedback ramp schedule
+  late binarization sharpen
+
+still disabled:
+  view contrast
+  batch neighbor contrast
+  memory neighbor contrast
+```
+
+代码变更：
+
+```text
+planner/retrieval_graph_planner.py
+  added arf_trace_targets(...)
+  supports P = omega_s P_s + omega_t P_t + omega_z P_z with per-call weights
+  builds S_i = N_i union A_i union R_i
+  computes missed/false feedback weights and diagnostics
+
+losses/arf_loss.py
+  added ARFLoss
+  supports warmup, actual trace, feedback ramp, late sharpen
+
+engine/train.py
+  objective=arf/full_arf/trace_arf now uses ARFLoss
+  logs arf_overlap, arf_false, arf_missed, arf_retrieved, arf_weight, eta_m, eta_f, omega_z, arf_gamma
+
+configs:
+  configs/rf_clath_ucf_full_arf.yaml
+  configs/rf_clath_hmdb_full_arf.yaml
+
+scripts:
+  tools/run_rf_clath_ucf_full_arf_disk2.sh
+  tools/run_rf_clath_hmdb_full_arf_disk2.sh
+```
+
+阶段5默认配置：
+
+| Component | Value |
+|---|---|
+| planner top_m | 20 |
+| main omega_s / omega_t / omega_z | 0.45 / 0.25 / 0.30 |
+| warmup epochs | 10 |
+| warmup omega_s / omega_t / omega_z | 0.65 / 0.35 / 0.00 |
+| retrieval top_r | 20 |
+| random anchors | 40 |
+| eta_missed_final | 1.0 |
+| eta_false_final | 1.0 |
+| feedback ramp epochs | 10 |
+| weight clip | 3.0 |
+| gamma | 8 |
+| late sharpen start_ratio | 0.70 |
+| late gamma | 10 |
+| late lambda_quant | 0.20 |
+| lambda_balance | 0.05 |
+
+远端验证：
+
+```text
+py_compile passed:
+  planner/retrieval_graph_planner.py
+  losses/arf_loss.py
+  losses/__init__.py
+  engine/train.py
+  train.py
+
+bash -n passed:
+  tools/run_rf_clath_ucf_full_arf_disk2.sh
+  tools/run_rf_clath_hmdb_full_arf_disk2.sh
+```
+
+Full ARF sanity：
+
+```text
+command:
+  HMDB16, cuda2, max_steps_per_epoch=2, run_until_epoch=1,
+  planner.warmup.epochs=0, feedback.ramp_epochs=1
+
+run:
+  /mnt/disk2/yql/RF-CLaTH_outputs/rf_clath_full_arf_sanity/hmdb_16b_20260609_131205
+```
+
+Sanity 结果：
+
+| Dataset | Bit | Steps | loss | L_ARF raw | L_hash | target count | target mean | actual overlap | false ratio | missed ratio | retrieved target | feedback weight | eta_m | eta_f | omega_z | gamma | P final topM | P random | Notes |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|
+| HMDB51 | 16 | 2 | 0.9948 | 0.8979 | 0.0969 | 79.9 | 0.567 | 0.165 | 0.835 | 0.729 | 0.564 | 1.265 | 1.0 | 1.0 | 0.30 | 10.0 | 0.6930 | 0.5121 | passed; actual trace and P_z active |

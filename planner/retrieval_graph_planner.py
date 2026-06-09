@@ -96,17 +96,23 @@ class RetrievalGraphPlanner:
         memory: PlannerMemoryBank,
         anchors: torch.Tensor,
         candidates: torch.Tensor,
+        omega_s: Optional[float] = None,
+        omega_t: Optional[float] = None,
+        omega_z: Optional[float] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
         p_s = self._component_sim(anchors, memory.sem_proto_bank, memory.sem_proto_bank, candidates)
         p_t = self._component_sim(anchors, memory.dyn_proto_bank, memory.dyn_proto_bank, candidates)
         self._mask_self(p_s, anchors, candidates)
         self._mask_self(p_t, anchors, candidates)
-        p_final = self.omega_s * p_s + self.omega_t * p_t
+        use_omega_s = self.omega_s if omega_s is None else float(omega_s)
+        use_omega_t = self.omega_t if omega_t is None else float(omega_t)
+        use_omega_z = self.omega_z if omega_z is None else float(omega_z)
+        p_final = use_omega_s * p_s + use_omega_t * p_t
         p_z: Optional[torch.Tensor] = None
-        if self.omega_z > 0:
+        if use_omega_z > 0:
             p_z = self._component_sim(anchors, memory.z_bank, memory.z_bank, candidates)
             self._mask_self(p_z, anchors, candidates)
-            p_final = p_final + self.omega_z * p_z
+            p_final = p_final + use_omega_z * p_z
         return p_final, p_s, p_t, p_z
 
     @torch.no_grad()
@@ -171,6 +177,9 @@ class RetrievalGraphPlanner:
         self,
         memory: PlannerMemoryBank,
         anchor_indices: torch.Tensor,
+        omega_s: Optional[float] = None,
+        omega_t: Optional[float] = None,
+        omega_z: Optional[float] = None,
     ) -> Dict[str, torch.Tensor]:
         """Build fixed-size Static ARF targets for a batch.
 
@@ -182,8 +191,9 @@ class RetrievalGraphPlanner:
         anchors = anchor_indices.detach().long().to(memory.device)
         if memory.u_bank is None:
             raise ValueError("Static ARF requires memory.u_bank; pass u_a/u_b to PlannerMemoryBank.update_batch.")
+        use_omega_z = self.omega_z if omega_z is None else float(omega_z)
         final_valid = memory.sem_dyn_valid & memory.u_valid
-        if self.omega_z > 0:
+        if use_omega_z > 0:
             final_valid = final_valid & memory.z_valid
         candidates = self._candidate_indices(final_valid)
         if candidates.numel() <= 1:
@@ -192,7 +202,14 @@ class RetrievalGraphPlanner:
             empty_mask = torch.empty(anchors.shape[0], 0, dtype=torch.bool, device=memory.device)
             return {"target_indices": empty_idx, "target_scores": empty_val, "target_mask": empty_mask}
 
-        p_final, _, _, _ = self._final_scores(memory, anchors, candidates)
+        p_final, _, _, _ = self._final_scores(
+            memory,
+            anchors,
+            candidates,
+            omega_s=omega_s,
+            omega_t=omega_t,
+            omega_z=omega_z,
+        )
         top_values, top_local = _topk(p_final, self.top_m)
         top_indices = candidates[top_local]
         top_mask = torch.isfinite(top_values)
@@ -222,6 +239,153 @@ class RetrievalGraphPlanner:
             "target_indices": target_indices,
             "target_scores": target_scores,
             "target_mask": target_mask,
+        }
+
+    @torch.no_grad()
+    def arf_trace_targets(
+        self,
+        memory: PlannerMemoryBank,
+        anchor_indices: torch.Tensor,
+        query_u: torch.Tensor,
+        top_r: int = 20,
+        random_anchors: Optional[int] = None,
+        use_actual_trace: bool = True,
+        omega_s: Optional[float] = None,
+        omega_t: Optional[float] = None,
+        omega_z: Optional[float] = None,
+        eta_missed: float = 1.0,
+        eta_false: float = 1.0,
+        weight_clip: float = 3.0,
+    ) -> Dict[str, torch.Tensor]:
+        """Build Full ARF targets for S_i = N_i union A_i union R_i.
+
+        N_i are planner top-M neighbors, A_i are actual Hamming retrieval
+        traces from current view hash codes against memory.u_bank, and R_i are
+        random anchors. The returned dense representation may contain
+        duplicates, but membership masks are computed against full N_i/A_i
+        sets so missed/false feedback still follows the ARF definition.
+        """
+
+        anchors = anchor_indices.detach().long().to(memory.device)
+        if memory.u_bank is None:
+            raise ValueError("Full ARF requires memory.u_bank; pass u_a/u_b to PlannerMemoryBank.update_batch.")
+
+        use_omega_z = self.omega_z if omega_z is None else float(omega_z)
+        final_valid = memory.sem_dyn_valid & memory.u_valid
+        if use_omega_z > 0:
+            final_valid = final_valid & memory.z_valid
+        candidates = self._candidate_indices(final_valid)
+        if candidates.numel() <= 1:
+            empty_idx = torch.empty(anchors.shape[0], 0, dtype=torch.long, device=memory.device)
+            empty_val = torch.empty(anchors.shape[0], 0, dtype=torch.float32, device=memory.device)
+            empty_mask = torch.empty(anchors.shape[0], 0, dtype=torch.bool, device=memory.device)
+            return {
+                "target_indices": empty_idx,
+                "target_scores": empty_val,
+                "target_mask": empty_mask,
+                "target_weights": empty_val,
+                "planned_indices": empty_idx,
+                "actual_indices": empty_idx,
+                "metric_actual_overlap": torch.zeros((), device=memory.device),
+                "metric_false_ratio": torch.zeros((), device=memory.device),
+                "metric_missed_ratio": torch.zeros((), device=memory.device),
+                "metric_retrieved_target_mean": torch.zeros((), device=memory.device),
+                "metric_feedback_weight_mean": torch.zeros((), device=memory.device),
+            }
+
+        p_final, _, _, _ = self._final_scores(
+            memory,
+            anchors,
+            candidates,
+            omega_s=omega_s,
+            omega_t=omega_t,
+            omega_z=omega_z,
+        )
+        planned_values, planned_local = _topk(p_final, self.top_m)
+        planned_indices = candidates[planned_local]
+        planned_mask = torch.isfinite(planned_values)
+
+        actual_count = max(0, int(top_r)) if use_actual_trace else 0
+        if actual_count > 0:
+            query = query_u.detach().float().to(memory.device)
+            query_bits = torch.sign(query)
+            query_bits[query_bits == 0] = 1
+            memory_bits = torch.sign(memory.u_bank[candidates].detach().float())
+            memory_bits[memory_bits == 0] = 1
+            trace_sim = query_bits @ memory_bits.t()
+            self._mask_self(trace_sim, anchors, candidates)
+            actual_values, actual_local = _topk(trace_sim, actual_count)
+            actual_indices = candidates[actual_local]
+            actual_mask = torch.isfinite(actual_values)
+            actual_scores = p_final.gather(dim=1, index=actual_local)
+        else:
+            actual_indices = torch.empty(anchors.shape[0], 0, dtype=torch.long, device=memory.device)
+            actual_scores = torch.empty(anchors.shape[0], 0, dtype=torch.float32, device=memory.device)
+            actual_mask = torch.empty(anchors.shape[0], 0, dtype=torch.bool, device=memory.device)
+
+        random_count = max(0, int(self.random_anchors if random_anchors is None else random_anchors))
+        if random_count > 0:
+            random_local = torch.randint(
+                low=0,
+                high=candidates.numel(),
+                size=(anchors.shape[0], random_count),
+                device=memory.device,
+            )
+            random_indices = candidates[random_local]
+            random_scores = p_final.gather(dim=1, index=random_local)
+            random_mask = random_indices != anchors.unsqueeze(1)
+            random_mask = random_mask & torch.isfinite(random_scores)
+        else:
+            random_indices = torch.empty(anchors.shape[0], 0, dtype=torch.long, device=memory.device)
+            random_scores = torch.empty(anchors.shape[0], 0, dtype=torch.float32, device=memory.device)
+            random_mask = torch.empty(anchors.shape[0], 0, dtype=torch.bool, device=memory.device)
+
+        target_indices = torch.cat([planned_indices, actual_indices, random_indices], dim=1)
+        target_scores = torch.cat([planned_values, actual_scores, random_scores], dim=1)
+        target_mask = torch.cat([planned_mask, actual_mask, random_mask], dim=1)
+
+        in_planned = (target_indices.unsqueeze(-1) == planned_indices.unsqueeze(1)).any(dim=-1)
+        in_actual = (
+            (target_indices.unsqueeze(-1) == actual_indices.unsqueeze(1)).any(dim=-1)
+            if actual_indices.numel() > 0
+            else torch.zeros_like(target_mask)
+        )
+        missed = in_planned & (~in_actual) & target_mask
+        false = in_actual & (~in_planned) & target_mask
+
+        target_scores = torch.clamp(torch.nan_to_num(target_scores, nan=0.0, posinf=0.0, neginf=0.0), 0.0, 1.0)
+        weights = torch.ones_like(target_scores)
+        weights = weights + float(eta_missed) * missed.float() * target_scores
+        weights = weights + float(eta_false) * false.float() * (1.0 - target_scores)
+        if weight_clip > 0:
+            weights = torch.clamp(weights, max=float(weight_clip))
+        weights = weights * target_mask.float()
+
+        if actual_indices.numel() > 0:
+            planned_actual_hits = (planned_indices.unsqueeze(-1) == actual_indices.unsqueeze(1)).any(dim=-1)
+            actual_planned_hits = (actual_indices.unsqueeze(-1) == planned_indices.unsqueeze(1)).any(dim=-1)
+            overlap = planned_actual_hits[planned_mask].float().mean() if planned_mask.any() else torch.zeros((), device=memory.device)
+            false_ratio = (~actual_planned_hits & actual_mask).float().sum() / actual_mask.float().sum().clamp_min(1.0)
+            retrieved_mean = actual_scores[actual_mask].mean() if actual_mask.any() else torch.zeros((), device=memory.device)
+        else:
+            overlap = torch.zeros((), device=memory.device)
+            false_ratio = torch.zeros((), device=memory.device)
+            retrieved_mean = torch.zeros((), device=memory.device)
+        missed_ratio = missed.float().sum() / (in_planned & target_mask).float().sum().clamp_min(1.0)
+        feedback_mean = weights[target_mask].mean() if target_mask.any() else torch.zeros((), device=memory.device)
+
+        return {
+            "target_indices": target_indices,
+            "target_scores": target_scores,
+            "target_mask": target_mask,
+            "target_weights": weights,
+            "planned_indices": planned_indices,
+            "actual_indices": actual_indices,
+            "metric_actual_overlap": overlap,
+            "metric_false_ratio": false_ratio,
+            "metric_missed_ratio": missed_ratio,
+            "metric_retrieved_target_mean": retrieved_mean,
+            "metric_feedback_weight_mean": feedback_mean,
         }
 
     def _random_final_mean(
