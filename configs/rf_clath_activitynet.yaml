@@ -1,33 +1,33 @@
 project:
-  name: RF-CLaTH-T-SAS-UCF-RePartition
-  output_dir: ./outputs/rf_clath_t_sas_ucf
+  name: RF-CLaTH-T-SAS-ActivityNet-RePartition
+  output_dir: ./outputs/rf_clath_t_sas_activitynet
   seed: 3346
 
 data:
-  name: s5vh_ucf
+  name: s5vh_activitynet
   cache_in_memory: false
   num_workers: 8
   pin_memory: true
   datasets:
-    s5vh_ucf:
-      dataset: s5vh_ucf
+    s5vh_activitynet:
+      dataset: s5vh_activitynet
       format: s5vh_h5
-      num_classes: 101
+      num_classes: 200
       feature_key: feats
-      train_feature_path: /mnt/disk2/yql/dataset_rePartition/ucf/ucf_train_feats.h5
-      val_feature_path: /mnt/disk2/yql/dataset_rePartition/ucf/ucf_test_feats.h5
-      test_feature_path: /mnt/disk2/yql/dataset_rePartition/ucf/ucf_test_feats.h5
-      retrieval_feature_path: /mnt/disk2/yql/dataset_rePartition/ucf/ucf_train_feats.h5
-      train_label_path: ./cache/repartition_s5vh_ucf_train_label.pt
-      val_label_path: ./cache/repartition_s5vh_ucf_q_label.pt
-      test_label_path: ./cache/repartition_s5vh_ucf_q_label.pt
-      retrieval_label_path: ./cache/repartition_s5vh_ucf_re_label.pt
+      train_feature_path: /mnt/disk2/yql/dataset_rePartition/activitynet/train_feats.h5
+      val_feature_path: /mnt/disk2/yql/dataset_rePartition/activitynet/query_feats.h5
+      test_feature_path: /mnt/disk2/yql/dataset_rePartition/activitynet/query_feats.h5
+      retrieval_feature_path: /mnt/disk2/yql/dataset_rePartition/activitynet/test_feats.h5
+      train_label_path: ""
+      val_label_path: ./cache/repartition_s5vh_activitynet_q_label.pt
+      test_label_path: ./cache/repartition_s5vh_activitynet_q_label.pt
+      retrieval_label_path: ./cache/repartition_s5vh_activitynet_re_label.pt
 
 model:
   input_type: features
-  num_frames: 25
+  num_frames: 30
   num_keyframes: 5
-  feature_dim: 4096
+  feature_dim: 2048
   hidden_dim: 512
   hash_bits: 64
 
@@ -39,7 +39,7 @@ model:
     strategy: t_sas
     trainable: false
     feature_source: input
-    segment_size: 5
+    segment_size: 6
     share_key_idx_across_views: true
     score_weights:
       global_repr: 0.4
@@ -127,21 +127,21 @@ neighbor:
   sim_chunk_size: 512
   build_on_cuda: true
   cache: true
-  cache_path: ./cache/repartition_s5vh_ucf_train_rawmean_top20.pt
+  cache_path: ./cache/repartition_s5vh_activitynet_train_rawmean_top20.pt
   label_precision_probe: 0
 
 planner:
   enabled: true
-  top_m: 20
+  top_m: 50
   omega_s: 0.65
   omega_t: 0.35
   omega_z: 0.0
-  random_anchors: 40
+  random_anchors: 50
   z_momentum: 0.9
   log_interval: 20
   device: auto
   include_z_metrics: true
-  label_precision: true
+  label_precision: false
 
 train:
   batch_size: 256

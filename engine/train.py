@@ -11,7 +11,9 @@ from torch.utils.data import DataLoader
 from datasets.video_dataset import build_dataloaders
 from engine.evaluate import evaluate_retrieval
 from losses import RFClathLoss
+from memory import PlannerMemoryBank, build_label_bank
 from models import RetrievalFeedbackContentLateralTemporalHashing
+from planner import RetrievalGraphPlanner
 from utils.checkpoint import load_checkpoint, save_checkpoint
 from utils.config import save_config
 from utils.cuda import configure_cuda_attention
@@ -76,6 +78,8 @@ def train_one_epoch(
     cfg: Dict,
     logger,
     neighbor_indices: Optional[torch.Tensor] = None,
+    planner_memory: Optional[PlannerMemoryBank] = None,
+    graph_planner: Optional[RetrievalGraphPlanner] = None,
 ) -> Dict[str, float]:
     model.train()
     criterion.train()
@@ -86,11 +90,14 @@ def train_one_epoch(
     scaler = torch.cuda.amp.GradScaler(enabled=amp_enabled)
     grad_clip = float(train_cfg.get("grad_clip", 0.0))
     log_interval = int(train_cfg.get("log_interval", 20))
+    planner_log_interval = int(cfg.get("planner", {}).get("log_interval", log_interval))
     max_steps = int(train_cfg.get("max_steps_per_epoch", 0))
 
     totals = {}
     metric_totals = {}
     metric_count = 0
+    planner_totals = {}
+    planner_count = 0
     actual_steps = 0
     start = time.time()
     for step, batch in enumerate(dataloader, start=1):
@@ -112,6 +119,49 @@ def train_one_epoch(
             nn.utils.clip_grad_norm_(list(model.parameters()) + list(criterion.parameters()), grad_clip)
         scaler.step(optimizer)
         scaler.update()
+
+        planner_metrics = None
+        if planner_memory is not None and graph_planner is not None:
+            with torch.no_grad():
+                planner_memory.update_batch(
+                    batch_indices_cpu,
+                    video.detach(),
+                    outputs["selected_indices"].detach(),
+                    outputs["z_a"].detach(),
+                    outputs["z_b"].detach(),
+                    epoch=epoch,
+                )
+                planner_should_log = (
+                    step % planner_log_interval == 0
+                    or step == len(dataloader)
+                    or (max_steps > 0 and step == max_steps)
+                )
+                if planner_should_log:
+                    planner_metrics = graph_planner.compute_sanity(planner_memory, batch_indices_cpu)
+                    for key, value in planner_metrics.items():
+                        planner_totals[key] = planner_totals.get(key, 0.0) + float(value)
+                    planner_count += 1
+                    logger.info(
+                        "epoch=%d step=%d/%d planner_sanity valid=%.3f z_valid=%.3f "
+                        "p_s_topm=%.4f p_t_topm=%.4f p_z_topm=%.4f p_final_topm=%.4f "
+                        "p_random=%.4f p_final_std=%.4f overlap_s_t=%.3f "
+                        "overlap_final_s=%.3f overlap_final_t=%.3f label_prec=%.3f",
+                        epoch,
+                        step,
+                        len(dataloader),
+                        planner_metrics.get("planner_valid_final", 0.0),
+                        planner_metrics.get("planner_valid_z", 0.0),
+                        planner_metrics.get("planner_p_s_topm", 0.0),
+                        planner_metrics.get("planner_p_t_topm", 0.0),
+                        planner_metrics.get("planner_p_z_topm", 0.0),
+                        planner_metrics.get("planner_p_final_topm", 0.0),
+                        planner_metrics.get("planner_p_random", 0.0),
+                        planner_metrics.get("planner_p_final_std", 0.0),
+                        planner_metrics.get("planner_overlap_s_t", 0.0),
+                        planner_metrics.get("planner_overlap_final_s", 0.0),
+                        planner_metrics.get("planner_overlap_final_t", 0.0),
+                        planner_metrics.get("planner_label_precision_topm", 0.0),
+                    )
 
         for key, value in losses.items():
             totals[key] = totals.get(key, 0.0) + float(value.detach().cpu())
@@ -154,6 +204,27 @@ def train_one_epoch(
     averaged = {key: value / count for key, value in totals.items()}
     metric_divisor = max(1, metric_count)
     averaged.update({key: value / metric_divisor for key, value in metric_totals.items()})
+    if planner_count > 0:
+        averaged.update({key: value / planner_count for key, value in planner_totals.items()})
+        logger.info(
+            "epoch=%d planner_sanity_avg valid=%.3f z_valid=%.3f "
+            "p_s_topm=%.4f p_t_topm=%.4f p_z_topm=%.4f p_final_topm=%.4f "
+            "p_random=%.4f p_final_std=%.4f overlap_s_t=%.3f "
+            "overlap_final_s=%.3f overlap_final_t=%.3f label_prec=%.3f",
+            epoch,
+            averaged.get("planner_valid_final", 0.0),
+            averaged.get("planner_valid_z", 0.0),
+            averaged.get("planner_p_s_topm", 0.0),
+            averaged.get("planner_p_t_topm", 0.0),
+            averaged.get("planner_p_z_topm", 0.0),
+            averaged.get("planner_p_final_topm", 0.0),
+            averaged.get("planner_p_random", 0.0),
+            averaged.get("planner_p_final_std", 0.0),
+            averaged.get("planner_overlap_s_t", 0.0),
+            averaged.get("planner_overlap_final_s", 0.0),
+            averaged.get("planner_overlap_final_t", 0.0),
+            averaged.get("planner_label_precision_topm", 0.0),
+        )
     logger.info(
         "epoch=%d train_time=%.1fs loss=%.4f view=%.4f semantic=%.4f hash=%.4f "
         "view_raw=%.4f batch_neigh=%.4f mem_neigh=%.4f quant=%.4f bit_bal=%.4f "
@@ -286,6 +357,40 @@ def train_rf_clath(
     if "loss" in cfg and "memory_neighbor" in cfg["loss"]:
         cfg["loss"]["memory_neighbor"]["num_items"] = len(train_loader.dataset)
     criterion = RFClathLoss(cfg).to(use_device)
+    planner_memory = None
+    graph_planner = None
+    planner_cfg = cfg.get("planner", {})
+    if bool(planner_cfg.get("enabled", False)):
+        planner_device_cfg = str(planner_cfg.get("device", "auto")).lower()
+        if planner_device_cfg == "cpu":
+            planner_device = torch.device("cpu")
+        else:
+            planner_device = use_device
+        labels = None
+        if bool(planner_cfg.get("label_precision", True)):
+            labels = build_label_bank(train_loader.dataset, planner_device)
+        planner_memory = PlannerMemoryBank(
+            num_items=len(train_loader.dataset),
+            device=planner_device,
+            raw_dim=int(cfg.get("model", {}).get("feature_dim", 0))
+            if cfg.get("model", {}).get("input_type", "features") == "features"
+            else 0,
+            z_dim=int(cfg.get("model", {}).get("hidden_dim", 0)),
+            z_momentum=float(planner_cfg.get("z_momentum", 0.9)),
+            labels=labels,
+        )
+        graph_planner = RetrievalGraphPlanner.from_config(planner_cfg)
+        logger.info(
+            "planner_graph enabled top_m=%d omega_s=%.3f omega_t=%.3f omega_z=%.3f "
+            "random_anchors=%d bank_device=%s label_precision=%s",
+            graph_planner.top_m,
+            graph_planner.omega_s,
+            graph_planner.omega_t,
+            graph_planner.omega_z,
+            graph_planner.random_anchors,
+            planner_device,
+            labels is not None,
+        )
     save_config(cfg, str(output_dir / "config.yaml"))
     optimizer = build_optimizer(model, criterion, cfg)
     scheduler = build_scheduler(optimizer, cfg)
@@ -326,6 +431,8 @@ def train_rf_clath(
             cfg,
             logger,
             neighbor_indices=neighbor_indices,
+            planner_memory=planner_memory,
+            graph_planner=graph_planner,
         )
         scheduler.step()
 

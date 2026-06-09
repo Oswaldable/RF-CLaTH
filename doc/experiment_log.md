@@ -104,3 +104,83 @@ Only fully completed runs are included in this snapshot.
 | HMDB51 | T-SAS + original loss | 64 | 100 | 0.1273 | 0.1257 | completed |
 | HMDB51 | trainable selector + original loss | 16 | 145 | 0.0971 | 0.0969 | selector ablation |
 | HMDB51 | trainable selector + original loss | 32 | 145 | 0.1141 | 0.1139 | selector ablation |
+
+## 2026-06-09 Stage2 Planner Graph Sanity
+
+实现范围：
+
+```text
+scope: UCF101, HMDB51, ActivityNet, and FCVID
+doc: doc/kamch_arf_push_plan.md, section 6
+goal: build Planner Graph and log sanity metrics without enabling ARF
+loss: unchanged original RFClathLoss
+new modules:
+  memory/memory_bank.py
+  planner/retrieval_graph_planner.py
+config enabled:
+  configs/rf_clath_ucf.yaml
+  configs/rf_clath_hmdb.yaml
+  configs/rf_clath_activitynet.yaml
+  configs/rf_clath_fcv.yaml
+```
+
+Planner 配置：
+
+```yaml
+planner_small_datasets:
+  enabled: true
+  top_m: 20
+  omega_s: 0.65
+  omega_t: 0.35
+  omega_z: 0.0
+  random_anchors: 40
+  z_momentum: 0.9
+  log_interval: 20
+  include_z_metrics: true
+  label_precision: true
+
+planner_large_datasets:
+  enabled: true
+  top_m: 50
+  omega_s: 0.65
+  omega_t: 0.35
+  omega_z: 0.0
+  random_anchors: 50
+  z_momentum: 0.9
+  log_interval: 20
+  include_z_metrics: true
+```
+
+远端验证：
+
+```text
+py_compile:
+  engine/train.py
+  memory/memory_bank.py
+  planner/retrieval_graph_planner.py
+
+short sanity command:
+  train.max_steps_per_epoch=2
+  train.eval_interval=999
+  train.save_interval=999
+  planner.log_interval=1
+  neighbor.enabled=false for ActivityNet/FCVID short sanity only
+```
+
+Sanity 结果：
+
+| Dataset | Run Dir | Steps | valid_final_avg | z_valid_avg | P_s topM | P_t topM | P_z topM | P final topM | P random | P final std | overlap(N_s,N_t) | overlap(N_final,N_s) | overlap(N_final,N_t) | label precision | Notes |
+|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|
+| UCF101 | /mnt/disk2/yql/RF-CLaTH_outputs/rf_clath_stage2_planner_sanity/s5vh_ucf_16b_20260609_102114 | 2 | 0.037 | 0.037 | 0.7154 | 0.8269 | 0.6982 | 0.7531 | 0.5680 | 0.0614 | 0.746 | 0.944 | 0.793 | 0.161 | passed; P final topM > P random |
+| HMDB51 | /mnt/disk2/yql/RF-CLaTH_outputs/rf_clath_stage2_planner_sanity/hmdb_16b_20260609_102234 | 2 | 0.096 | 0.096 | 0.6803 | 0.7964 | 0.6549 | 0.7200 | 0.5540 | 0.0523 | 0.781 | 0.947 | 0.826 | 0.136 | passed; P final topM > P random |
+| ActivityNet | /mnt/disk2/yql/RF-CLaTH_outputs/rf_clath_stage2_planner_sanity/s5vh_activitynet_16b_20260609_102949 | 2 | 0.043 | 0.043 | 0.8026 | 0.8899 | 0.7388 | 0.8315 | 0.7618 | 0.0346 | 0.654 | 0.928 | 0.718 | 0.000 | passed; P final topM > P random; train labels unavailable so label precision disabled |
+| FCVID | /mnt/disk2/yql/RF-CLaTH_outputs/rf_clath_stage2_planner_sanity/s5vh_fcv_16b_20260609_103121 | 2 | 0.008 | 0.008 | 0.5318 | 0.6816 | 0.5552 | 0.5827 | 0.4321 | 0.0748 | 0.801 | 0.942 | 0.855 | 0.028 | passed; P final topM > P random |
+
+解释：
+
+```text
+valid_final/z_valid 偏低是因为 sanity run 只跑了 2 个 step，memory bank 只覆盖了少量训练样本。
+P final topM 明显高于 P random，说明 Planner Graph 在四个数据集上有基本筛选能力。
+omega_z=0，所以 P_z 只作为日志诊断，不参与 P final。
+ActivityNet train label cache 不存在，label precision 不作为该数据集的阶段二验收指标。
+```

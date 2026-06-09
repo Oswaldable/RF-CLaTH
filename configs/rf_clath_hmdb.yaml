@@ -130,6 +130,19 @@ neighbor:
   cache_path: ./cache/repartition_hmdb_train_rawmean_top20.pt
   label_precision_probe: 0
 
+planner:
+  enabled: true
+  top_m: 20
+  omega_s: 0.65
+  omega_t: 0.35
+  omega_z: 0.0
+  random_anchors: 40
+  z_momentum: 0.9
+  log_interval: 20
+  device: auto
+  include_z_metrics: true
+  label_precision: true
+
 train:
   batch_size: 256
   epochs: 150

@@ -1,27 +1,27 @@
 project:
-  name: RF-CLaTH-T-SAS-UCF-RePartition
-  output_dir: ./outputs/rf_clath_t_sas_ucf
+  name: RF-CLaTH-T-SAS-FCVID-RePartition
+  output_dir: ./outputs/rf_clath_t_sas_fcv
   seed: 3346
 
 data:
-  name: s5vh_ucf
+  name: s5vh_fcv
   cache_in_memory: false
   num_workers: 8
   pin_memory: true
   datasets:
-    s5vh_ucf:
-      dataset: s5vh_ucf
+    s5vh_fcv:
+      dataset: s5vh_fcv
       format: s5vh_h5
-      num_classes: 101
+      num_classes: 239
       feature_key: feats
-      train_feature_path: /mnt/disk2/yql/dataset_rePartition/ucf/ucf_train_feats.h5
-      val_feature_path: /mnt/disk2/yql/dataset_rePartition/ucf/ucf_test_feats.h5
-      test_feature_path: /mnt/disk2/yql/dataset_rePartition/ucf/ucf_test_feats.h5
-      retrieval_feature_path: /mnt/disk2/yql/dataset_rePartition/ucf/ucf_train_feats.h5
-      train_label_path: ./cache/repartition_s5vh_ucf_train_label.pt
-      val_label_path: ./cache/repartition_s5vh_ucf_q_label.pt
-      test_label_path: ./cache/repartition_s5vh_ucf_q_label.pt
-      retrieval_label_path: ./cache/repartition_s5vh_ucf_re_label.pt
+      train_feature_path: /mnt/disk2/yql/dataset_rePartition/fcv/fcv_train_feats.h5
+      val_feature_path: /mnt/disk2/yql/dataset_rePartition/fcv/fcv_query_feats.h5
+      test_feature_path: /mnt/disk2/yql/dataset_rePartition/fcv/fcv_query_feats.h5
+      retrieval_feature_path: /mnt/disk2/yql/dataset_rePartition/fcv/fcv_test_feats.h5
+      train_label_path: ./cache/repartition_s5vh_fcv_train_label.pt
+      val_label_path: ./cache/repartition_s5vh_fcv_q_label.pt
+      test_label_path: ./cache/repartition_s5vh_fcv_q_label.pt
+      retrieval_label_path: ./cache/repartition_s5vh_fcv_re_label.pt
 
 model:
   input_type: features
@@ -123,20 +123,20 @@ neighbor:
   enabled: true
   topk: 20
   neighbors_per_anchor: 1
-  feature_batch_size: 256
+  feature_batch_size: 512
   sim_chunk_size: 512
   build_on_cuda: true
   cache: true
-  cache_path: ./cache/repartition_s5vh_ucf_train_rawmean_top20.pt
+  cache_path: ./cache/repartition_s5vh_fcv_train_rawmean_top20.pt
   label_precision_probe: 0
 
 planner:
   enabled: true
-  top_m: 20
+  top_m: 50
   omega_s: 0.65
   omega_t: 0.35
   omega_z: 0.0
-  random_anchors: 40
+  random_anchors: 50
   z_momentum: 0.9
   log_interval: 20
   device: auto
@@ -144,7 +144,7 @@ planner:
   label_precision: true
 
 train:
-  batch_size: 256
+  batch_size: 512
   epochs: 150
   optimizer: adamw
   lr: 3e-5
