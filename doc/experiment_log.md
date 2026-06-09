@@ -1,6 +1,6 @@
 # RF-CLaTH Experiment Log
 
-更新时间：2026-06-09 08:27，时区 Asia/Shanghai。
+更新时间：2026-06-09 18:13，时区 Asia/Shanghai。
 
 记录规则：
 
@@ -23,11 +23,11 @@ bits: 16, 32, 64
 execution: serial within one queue
 remote output root: /mnt/disk2/yql/RF-CLaTH_outputs/rf_clath_t_sas_ucf_disk2
 launcher pid: 1135399
-active train pid: 2629931
+active train pid: 715494
 remote launcher log: /mnt/disk2/yql/RF-CLaTH_run_logs/rf_clath_t_sas_ucf_cuda1_launcher_20260608_141126.log
 remote queue log: /mnt/disk2/yql/RF-CLaTH_run_logs/rf_clath_t_sas_ucf_disk2_20260608_141126.queue.log
-status: 16-bit completed; 32-bit running, current epoch 40/150; 64-bit queued
-latest eval: 32-bit epoch 40, mAP@5=0.7586, mAP@20=0.6255, mAP@100=0.3809
+status: 16/32-bit completed; 64-bit running
+latest eval: 64-bit epoch 25, mAP@5=0.8008, mAP@20=0.6330, mAP@100=0.3987
 ```
 
 结果记录：
@@ -35,8 +35,8 @@ latest eval: 32-bit epoch 40, mAP@5=0.7586, mAP@20=0.6255, mAP@100=0.3809
 | Bits | Run Dir | Best Checkpoint | Selected Epoch | mAP@5 | mAP@20 | mAP@40 | mAP@60 | mAP@80 | mAP@100 | P@5 | P@20 | P@100 | R@5 | R@20 | R@100 | Notes |
 |---:|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|
 | 16 | /mnt/disk2/yql/RF-CLaTH_outputs/rf_clath_t_sas_ucf_disk2/s5vh_ucf_16b_20260608_141136 | /mnt/disk2/yql/RF-CLaTH_outputs/rf_clath_t_sas_ucf_disk2/s5vh_ucf_16b_20260608_141136/best.pth | 70 | 0.6782 | 0.5820 | 0.5159 | 0.4550 | 0.3980 | 0.3434 | 0.7214 | 0.6462 | 0.4143 | 0.0361 | 0.1288 | 0.4109 | completed; final epoch 150 mAP@100=0.3410 |
-| 32 | /mnt/disk2/yql/RF-CLaTH_outputs/rf_clath_t_sas_ucf_disk2/s5vh_ucf_32b_20260608_223349 | /mnt/disk2/yql/RF-CLaTH_outputs/rf_clath_t_sas_ucf_disk2/s5vh_ucf_32b_20260608_223349/best.pth | 35 | 0.7660 | 0.6258 | 0.5509 | 0.4933 | 0.4366 | 0.3814 | 0.7936 | 0.6751 | 0.4515 | 0.0398 | 0.1349 | 0.4458 | running; current epoch 40/150 |
-| 64 | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD | queued |
+| 32 | /mnt/disk2/yql/RF-CLaTH_outputs/rf_clath_t_sas_ucf_disk2/s5vh_ucf_32b_20260608_223349 | /mnt/disk2/yql/RF-CLaTH_outputs/rf_clath_t_sas_ucf_disk2/s5vh_ucf_32b_20260608_223349/best.pth | 60 | 0.7579 | 0.6324 | 0.5593 | 0.5027 | 0.4458 | 0.3888 | 0.7869 | 0.6823 | 0.4573 | 0.0395 | 0.1363 | 0.4523 | completed; final epoch 150 mAP@100=0.3831 |
+| 64 | /mnt/disk2/yql/RF-CLaTH_outputs/rf_clath_t_sas_ucf_disk2/s5vh_ucf_64b_20260609_084849 | TBD | 25 | 0.8008 | 0.6330 | 0.5563 | 0.5027 | 0.4508 | 0.3987 | 0.8177 | 0.6757 | 0.4703 | 0.0410 | 0.1350 | 0.4637 | running; latest epoch 25/150, not a completed result |
 
 ### HMDB51 16/32/64-bit
 
@@ -75,18 +75,32 @@ gpu: cuda2
 bits: 16, 32, 64
 execution: serial within one queue
 remote output root: /mnt/disk2/yql/RF-CLaTH_outputs/rf_clath_trainable_hmdb_disk2
-launcher pid: 2985206
-active train pid: 2985228
+launcher pid: stopped
+active train pid: none
 remote launcher log: /mnt/disk2/yql/RF-CLaTH_run_logs/rf_clath_trainable_hmdb_cuda2_launcher_20260609_003938.log
 remote queue log: /mnt/disk2/yql/RF-CLaTH_run_logs/rf_clath_trainable_hmdb_disk2_20260609_003938.queue.log
-status: running 16-bit
-note: this is a selector ablation against the completed HMDB T-SAS runs above.
+status: 16/32-bit completed; 64-bit stopped at epoch 29 before completion
+note: selector ablation. Current evidence does not justify using trainable selector as the main method.
 ```
 
 结果记录：
 
 | Bits | Run Dir | Best Checkpoint | Selected Epoch | mAP@5 | mAP@20 | mAP@40 | mAP@60 | mAP@80 | mAP@100 | P@5 | P@20 | P@100 | R@5 | R@20 | R@100 | Notes |
 |---:|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|
-| 16 | /mnt/disk2/yql/RF-CLaTH_outputs/rf_clath_trainable_hmdb_disk2/hmdb_16b_20260609_003941 | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD | running |
-| 32 | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD | queued |
-| 64 | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD | queued |
+| 16 | /mnt/disk2/yql/RF-CLaTH_outputs/rf_clath_trainable_hmdb_disk2/hmdb_16b_20260609_003941 | /mnt/disk2/yql/RF-CLaTH_outputs/rf_clath_trainable_hmdb_disk2/hmdb_16b_20260609_003941/best.pth | 145 | 0.3050 | 0.2357 | 0.1825 | 0.1437 | 0.1156 | 0.0971 | 0.3595 | 0.3129 | 0.1681 | 0.0240 | 0.0834 | 0.2241 | completed; final epoch 150 mAP@100=0.0969 |
+| 32 | /mnt/disk2/yql/RF-CLaTH_outputs/rf_clath_trainable_hmdb_disk2/hmdb_32b_20260609_044742 | /mnt/disk2/yql/RF-CLaTH_outputs/rf_clath_trainable_hmdb_disk2/hmdb_32b_20260609_044742/best.pth | 145 | 0.3705 | 0.2774 | 0.2137 | 0.1685 | 0.1364 | 0.1141 | 0.4191 | 0.3507 | 0.1880 | 0.0279 | 0.0935 | 0.2507 | completed; final epoch 150 mAP@100=0.1139 |
+| 64 | /mnt/disk2/yql/RF-CLaTH_outputs/rf_clath_trainable_hmdb_disk2/hmdb_64b_20260609_092340 | TBD | 25 | 0.3716 | 0.2570 | 0.1985 | 0.1599 | 0.1321 | 0.1118 | 0.4174 | 0.3329 | 0.1921 | 0.0278 | 0.0888 | 0.2561 | stopped before completion; latest/best eval at epoch 25, not a completed result |
+
+### Completed Result Snapshot
+
+Only fully completed runs are included in this snapshot.
+
+| Dataset | Method | Bits | Best Epoch | Best mAP@100 | Final mAP@100 | Main Note |
+|---|---|---:|---:|---:|---:|---|
+| UCF101 | T-SAS + original loss | 16 | 70 | 0.3434 | 0.3410 | completed |
+| UCF101 | T-SAS + original loss | 32 | 60 | 0.3888 | 0.3831 | completed |
+| HMDB51 | T-SAS + original loss | 16 | 65 | 0.0994 | 0.0952 | completed |
+| HMDB51 | T-SAS + original loss | 32 | 100 | 0.1134 | 0.1122 | completed |
+| HMDB51 | T-SAS + original loss | 64 | 100 | 0.1273 | 0.1257 | completed |
+| HMDB51 | trainable selector + original loss | 16 | 145 | 0.0971 | 0.0969 | selector ablation |
+| HMDB51 | trainable selector + original loss | 32 | 145 | 0.1141 | 0.1139 | selector ablation |
