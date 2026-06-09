@@ -1,5 +1,5 @@
 project:
-  name: RF-CLaTH-StaticARF-HMDB-RePartition
+  name: RF-CLaTH-StaticARF-Tuned-HMDB-RePartition
   output_dir: ./outputs/rf_clath_static_arf_hmdb
   seed: 3346
 
@@ -107,12 +107,12 @@ loss:
     lambda: 1.0
 
 arf_loss:
-  gamma: 8
+  gamma: 6
 
 loss_weights:
   lambda_arf: 1.0
-  lambda_quant: 0.10
-  lambda_balance: 0.05
+  lambda_quant: 0.20
+  lambda_balance: 0.10
 
 neighbor:
   enabled: false
@@ -127,13 +127,13 @@ neighbor:
 
 planner:
   enabled: true
-  top_m: 20
+  top_m: 10
   omega_s: 0.65
   omega_t: 0.35
   omega_z: 0.0
-  random_anchors: 40
+  random_anchors: 20
   z_momentum: 0.9
-  u_momentum: 0.9
+  u_momentum: 0.5
   log_interval: 20
   device: auto
   include_z_metrics: true
