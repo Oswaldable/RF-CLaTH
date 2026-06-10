@@ -862,8 +862,57 @@ example sanity metrics:
 ```text
 arf_raw      = L_ARF_memory_InfoNCE raw value
 arf_targets  = positives per anchor
+arf_hpos     = planned-not-actual hard positives per anchor
 arf_hard     = actual-not-planned hard negatives per anchor
 arf_overlap  = planned/actual overlap
 arf_false    = actual retrieval false ratio
 arf_missed   = planned missed by actual ratio
+```
+
+## 2026-06-10 ARF Memory Contrastive A/C Launch
+
+目的：并行验证两条低风险改进：
+
+```text
+A: missed hard positive weighting
+   hard positive = N_i \ A_i
+   numerator weight = 1.5
+
+C: delayed actual trace / hard mining
+   actual_trace_start_epoch = 40
+   hard_mining_start_epoch = 40
+```
+
+实现修正：
+
+```text
+hard mining is enabled only when actual trace is enabled.
+This prevents warmup epochs from treating all planned neighbors as missed positives.
+```
+
+启动任务：
+
+| Dataset | Bit | Experiment | GPU | Launcher PID | Train PID | Train Dir | Launcher Log | Queue Log | Notes |
+|---|---:|---|---:|---:|---:|---|---|---|---|
+| HMDB51 | 16 | A: missed hard positive | cuda2 | 3394129 | 3394137 | `/mnt/disk2/yql/RF-CLaTH_outputs/rf_clath_arf_mem_contrastive_A_hmdb16_hmdb_disk2/hmdb_16b_20260610_102658` | `/mnt/disk2/yql/RF-CLaTH_run_logs/rf_clath_arf_mem_contrastive_A_hmdb16_cuda2_launcher_20260610_102657.log` | `/mnt/disk2/yql/RF-CLaTH_run_logs/rf_clath_arf_mem_contrastive_A_hmdb16_hmdb_disk2_20260610_102657.queue.log` | restarted after warmup hard-positive guard |
+| HMDB51 | 16 | C: delayed hard mining | cuda3 | 3353673 | 3353682 | `/mnt/disk2/yql/RF-CLaTH_outputs/rf_clath_arf_mem_contrastive_C_hmdb16_hmdb_disk2/hmdb_16b_20260610_102258` | `/mnt/disk2/yql/RF-CLaTH_run_logs/rf_clath_arf_mem_contrastive_C_hmdb16_cuda3_launcher_20260610_102256.log` | `/mnt/disk2/yql/RF-CLaTH_run_logs/rf_clath_arf_mem_contrastive_C_hmdb16_hmdb_disk2_20260610_102256.queue.log` | actual/hard mining start at epoch 40 |
+
+启动验证：
+
+```text
+remote py_compile: passed
+bash -n: passed
+fake sanity:
+  A: hpos > 0, hard > 0
+  C pre-start: hpos = 0, hard = 0
+
+A first epoch after restart:
+  arf_targets=10.0
+  arf_hpos=0.0
+  arf_hard=0.0
+
+C first epochs:
+  arf_targets=10.0
+  arf_hpos=0.0
+  arf_hard=0.0
 ```

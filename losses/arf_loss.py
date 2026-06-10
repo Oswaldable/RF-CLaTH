@@ -433,8 +433,12 @@ class ContrastiveARFLoss(HybridARFLoss):
         )
         self.arf_positive_threshold = float(contrast_cfg.get("positive_threshold", 0.0))
         self.include_planned_actual_overlap = bool(contrast_cfg.get("include_planned_actual_overlap", True))
+        self.include_missed_as_positive = bool(contrast_cfg.get("include_missed_as_positive", False))
         self.fallback_positive_topk = max(1, int(contrast_cfg.get("fallback_positive_topk", 1)))
+        self.hard_positive_weight = max(1.0, float(contrast_cfg.get("hard_positive_weight", 1.0)))
         self.hard_negative_weight = max(1.0, float(contrast_cfg.get("hard_negative_weight", 1.0)))
+        self.actual_trace_start_epoch = int(contrast_cfg.get("actual_trace_start_epoch", 0))
+        self.hard_mining_start_epoch = int(contrast_cfg.get("hard_mining_start_epoch", 0))
 
     def _membership(
         self,
@@ -450,7 +454,8 @@ class ContrastiveARFLoss(HybridARFLoss):
         self,
         targets: Dict[str, torch.Tensor],
         device: torch.device,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        hard_mining_enabled: bool,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         target_indices = targets["target_indices"].to(device)
         target_scores = targets["target_scores"].to(device)
         target_mask = targets["target_mask"].to(device)
@@ -471,6 +476,12 @@ class ContrastiveARFLoss(HybridARFLoss):
         if self.include_planned_actual_overlap:
             positive_mask = positive_mask | (in_planned & in_actual)
 
+        missed_positive_mask = torch.zeros_like(target_mask)
+        if hard_mining_enabled:
+            missed_positive_mask = in_planned & (~in_actual) & target_mask
+            if self.include_missed_as_positive:
+                positive_mask = positive_mask | missed_positive_mask
+
         if planned_cols > 0:
             no_positive = ~positive_mask.any(dim=1)
             fallback_cols = min(planned_cols, self.fallback_positive_topk)
@@ -478,8 +489,11 @@ class ContrastiveARFLoss(HybridARFLoss):
             fallback[:, :fallback_cols] = target_mask[:, :fallback_cols]
             positive_mask = positive_mask | (no_positive[:, None] & fallback)
 
-        hard_negative_mask = in_actual & (~in_planned) & (~positive_mask)
-        return positive_mask & target_mask, hard_negative_mask & target_mask
+        hard_negative_mask = torch.zeros_like(target_mask)
+        if hard_mining_enabled:
+            hard_negative_mask = in_actual & (~in_planned) & (~positive_mask)
+        hard_positive_mask = missed_positive_mask & positive_mask
+        return positive_mask & target_mask, hard_positive_mask & target_mask, hard_negative_mask & target_mask
 
     def _memory_info_nce(
         self,
@@ -488,6 +502,7 @@ class ContrastiveARFLoss(HybridARFLoss):
         sample_indices: torch.Tensor,
         target_indices: torch.Tensor,
         positive_mask: torch.Tensor,
+        hard_positive_mask: torch.Tensor,
         hard_negative_mask: torch.Tensor,
     ) -> torch.Tensor:
         if memory.u_bank is None or u.shape[0] == 0:
@@ -501,6 +516,7 @@ class ContrastiveARFLoss(HybridARFLoss):
         sample_indices = sample_indices.to(device=device, dtype=torch.long)
         target_indices = target_indices.to(device=device, dtype=torch.long)
         positive_mask = positive_mask.to(device=device, dtype=torch.bool)
+        hard_positive_mask = hard_positive_mask.to(device=device, dtype=torch.bool)
         hard_negative_mask = hard_negative_mask.to(device=device, dtype=torch.bool)
 
         memory_u = memory.u_bank.index_select(0, valid_indices.to(memory.u_bank.device))
@@ -513,6 +529,9 @@ class ContrastiveARFLoss(HybridARFLoss):
         positive_indices = target_indices.masked_fill(~positive_mask, -1)
         positive_cols = (positive_indices.unsqueeze(-1) == valid_indices.view(1, 1, -1)).any(dim=1)
         positive_cols = positive_cols & (~self_mask)
+        hard_positive_indices = target_indices.masked_fill(~hard_positive_mask, -1)
+        hard_positive_cols = (hard_positive_indices.unsqueeze(-1) == valid_indices.view(1, 1, -1)).any(dim=1)
+        hard_positive_cols = hard_positive_cols & positive_cols
 
         hard_negative_indices = target_indices.masked_fill(~hard_negative_mask, -1)
         hard_negative_cols = (hard_negative_indices.unsqueeze(-1) == valid_indices.view(1, 1, -1)).any(dim=1)
@@ -528,6 +547,8 @@ class ContrastiveARFLoss(HybridARFLoss):
         if self.hard_negative_weight > 1.0:
             denom_logits = denom_logits + hard_negative_cols.float() * math.log(self.hard_negative_weight)
         positive_logits = logits.masked_fill(~positive_cols, mask_value)
+        if self.hard_positive_weight > 1.0:
+            positive_logits = positive_logits + hard_positive_cols.float() * math.log(self.hard_positive_weight)
         loss = torch.logsumexp(denom_logits, dim=1) - torch.logsumexp(positive_logits, dim=1)
         return loss[valid_rows].mean().to(dtype=u.dtype)
 
@@ -539,6 +560,7 @@ class ContrastiveARFLoss(HybridARFLoss):
         planner,
         sample_indices: torch.Tensor,
         schedule: Dict[str, float | bool],
+        hard_mining_enabled: bool,
     ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor], Dict[str, torch.Tensor]]:
         device = outputs[view_key].device
         targets = planner.arf_trace_targets(
@@ -555,13 +577,18 @@ class ContrastiveARFLoss(HybridARFLoss):
             eta_false=float(schedule["eta_false"]),
             weight_clip=self.weight_clip,
         )
-        positive_mask, hard_negative_mask = self._positive_negative_masks(targets, device)
+        positive_mask, hard_positive_mask, hard_negative_mask = self._positive_negative_masks(
+            targets,
+            device,
+            hard_mining_enabled=hard_mining_enabled,
+        )
         loss = self._memory_info_nce(
             outputs[view_key],
             memory,
             sample_indices,
             targets["target_indices"].to(device),
             positive_mask,
+            hard_positive_mask,
             hard_negative_mask,
         )
 
@@ -569,10 +596,12 @@ class ContrastiveARFLoss(HybridARFLoss):
         scores = targets["target_scores"].to(device)
         positive_count = positive_mask.float().sum(dim=1).mean() if positive_mask.numel() > 0 else zero
         positive_mean = scores[positive_mask].mean() if positive_mask.any() else zero
+        hard_positive_count = hard_positive_mask.float().sum(dim=1).mean() if hard_positive_mask.numel() > 0 else zero
         hard_count = hard_negative_mask.float().sum(dim=1).mean() if hard_negative_mask.numel() > 0 else zero
         metrics = {
             "positive_count": positive_count,
             "positive_mean": positive_mean,
+            "hard_positive_count": hard_positive_count,
             "hard_negative_count": hard_count,
         }
         return loss, targets, metrics
@@ -589,6 +618,14 @@ class ContrastiveARFLoss(HybridARFLoss):
         epoch_tensor = outputs.get("epoch", torch.ones((), device=device))
         epoch = int(epoch_tensor.detach().cpu().item()) if torch.is_tensor(epoch_tensor) else int(epoch_tensor)
         schedule = self._schedule(epoch)
+        if self.actual_trace_start_epoch > 0 and epoch < self.actual_trace_start_epoch:
+            schedule = dict(schedule)
+            schedule["use_actual_trace"] = False
+            schedule["eta_missed"] = 0.0
+            schedule["eta_false"] = 0.0
+        hard_mining_enabled = bool(schedule["use_actual_trace"]) and (
+            self.hard_mining_start_epoch <= 0 or epoch >= self.hard_mining_start_epoch
+        )
 
         loss_a, targets_a, trace_metrics_a = self._trace_contrastive_loss(
             outputs,
@@ -597,6 +634,7 @@ class ContrastiveARFLoss(HybridARFLoss):
             planner,
             sample_indices,
             schedule,
+            hard_mining_enabled,
         )
         loss_b, targets_b, trace_metrics_b = self._trace_contrastive_loss(
             outputs,
@@ -605,6 +643,7 @@ class ContrastiveARFLoss(HybridARFLoss):
             planner,
             sample_indices,
             schedule,
+            hard_mining_enabled,
         )
         component_arf = 0.5 * (loss_a + loss_b)
 
@@ -656,6 +695,8 @@ class ContrastiveARFLoss(HybridARFLoss):
             * (trace_metrics_a["positive_count"].float() + trace_metrics_b["positive_count"].float()),
             "metric_arf_target_mean": 0.5
             * (trace_metrics_a["positive_mean"].float() + trace_metrics_b["positive_mean"].float()),
+            "metric_arf_hard_positive_count": 0.5
+            * (trace_metrics_a["hard_positive_count"].float() + trace_metrics_b["hard_positive_count"].float()),
             "metric_arf_hard_negative_count": 0.5
             * (trace_metrics_a["hard_negative_count"].float() + trace_metrics_b["hard_negative_count"].float()),
             "metric_arf_actual_overlap": avg_target_metric("metric_actual_overlap"),

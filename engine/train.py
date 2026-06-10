@@ -199,7 +199,7 @@ def train_one_epoch(
             logger.info(
                 "epoch=%d step=%d/%d loss=%.4f view=%.4f semantic=%.4f hash=%.4f "
                 "view_raw=%.4f batch_neigh=%.4f mem_neigh=%.4f arf_raw=%.4f "
-                "quant=%.4f bit_bal=%.4f arf_targets=%.1f arf_target=%.3f arf_hard=%.1f "
+                "quant=%.4f bit_bal=%.4f arf_targets=%.1f arf_target=%.3f arf_hpos=%.1f arf_hard=%.1f "
                 "arf_overlap=%.3f arf_false=%.3f arf_missed=%.3f arf_retrieved=%.3f "
                 "arf_weight=%.3f eta_m=%.3f eta_f=%.3f omega_z=%.3f arf_gamma=%.1f "
                 "agree=%.3f hamm=%.3f entropy=%.3f bit_use=%.3f sat=%.3f mask=%.3f fast_cos=%.3f",
@@ -218,6 +218,7 @@ def train_one_epoch(
                 float(losses["component_bit_balance"].detach().cpu()),
                 float(losses.get("metric_arf_target_count", torch.zeros((), device=device)).detach().cpu()),
                 float(losses.get("metric_arf_target_mean", torch.zeros((), device=device)).detach().cpu()),
+                float(losses.get("metric_arf_hard_positive_count", torch.zeros((), device=device)).detach().cpu()),
                 float(losses.get("metric_arf_hard_negative_count", torch.zeros((), device=device)).detach().cpu()),
                 float(losses.get("metric_arf_actual_overlap", torch.zeros((), device=device)).detach().cpu()),
                 float(losses.get("metric_arf_false_ratio", torch.zeros((), device=device)).detach().cpu()),
@@ -268,7 +269,7 @@ def train_one_epoch(
     logger.info(
         "epoch=%d train_time=%.1fs loss=%.4f view=%.4f semantic=%.4f hash=%.4f "
         "view_raw=%.4f batch_neigh=%.4f mem_neigh=%.4f arf_raw=%.4f "
-        "quant=%.4f bit_bal=%.4f arf_targets=%.1f arf_target=%.3f arf_hard=%.1f "
+        "quant=%.4f bit_bal=%.4f arf_targets=%.1f arf_target=%.3f arf_hpos=%.1f arf_hard=%.1f "
         "arf_overlap=%.3f arf_false=%.3f arf_missed=%.3f arf_retrieved=%.3f "
         "arf_weight=%.3f eta_m=%.3f eta_f=%.3f omega_z=%.3f arf_gamma=%.1f "
         "agree=%.3f hamm=%.3f entropy=%.3f bit_use=%.3f balance_abs=%.3f sat=%.3f std=%.3f pos=%.3f mask=%.3f fast_cos=%.3f fused_cos=%.3f",
@@ -286,6 +287,7 @@ def train_one_epoch(
         averaged.get("component_bit_balance", 0.0),
         averaged.get("metric_arf_target_count", 0.0),
         averaged.get("metric_arf_target_mean", 0.0),
+        averaged.get("metric_arf_hard_positive_count", 0.0),
         averaged.get("metric_arf_hard_negative_count", 0.0),
         averaged.get("metric_arf_actual_overlap", 0.0),
         averaged.get("metric_arf_false_ratio", 0.0),
