@@ -16,6 +16,7 @@ from losses import (
     ContrastiveARFLoss,
     HybridARFLoss,
     RFClathLoss,
+    Stage1WarmupAgenticUnifiedLoss,
     StaticARFLoss,
 )
 from memory import PlannerMemoryBank, build_label_bank
@@ -74,6 +75,8 @@ def build_criterion(cfg: Dict) -> nn.Module:
         return ContrastiveARFLoss(cfg)
     if objective in {"agentic_unified_contrastive", "agentic_contrastive", "unified_agentic_contrastive"}:
         return AgenticUnifiedContrastiveLoss(cfg)
+    if objective in {"stage1_warmup_agentic_unified", "stage1_then_agentic_unified"}:
+        return Stage1WarmupAgenticUnifiedLoss(cfg)
     return RFClathLoss(cfg)
 
 

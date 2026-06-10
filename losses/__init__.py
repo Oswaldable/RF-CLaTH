@@ -1,4 +1,11 @@
-from .arf_loss import ARFLoss, AgenticUnifiedContrastiveLoss, ContrastiveARFLoss, HybridARFLoss, StaticARFLoss
+from .arf_loss import (
+    ARFLoss,
+    AgenticUnifiedContrastiveLoss,
+    ContrastiveARFLoss,
+    HybridARFLoss,
+    Stage1WarmupAgenticUnifiedLoss,
+    StaticARFLoss,
+)
 from .total_loss import RFClathLoss
 
 __all__ = [
@@ -8,4 +15,5 @@ __all__ = [
     "HybridARFLoss",
     "ContrastiveARFLoss",
     "AgenticUnifiedContrastiveLoss",
+    "Stage1WarmupAgenticUnifiedLoss",
 ]

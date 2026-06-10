@@ -9,6 +9,7 @@ from torch import nn
 
 from .contrastive import HashContrastiveLoss, NeighborHashContrastiveLoss
 from .hash_losses import BalanceLoss, QuantizationLoss
+from .total_loss import RFClathLoss
 
 
 def _get_nested(cfg: Dict, path: Tuple[str, ...], default=None):
@@ -1069,3 +1070,60 @@ class AgenticUnifiedContrastiveLoss(ContrastiveARFLoss):
             "metric_arf_gamma": torch.tensor(float(schedule["gamma"]), device=device),
             "metric_arf_lambda_quant": torch.tensor(float(schedule["lambda_quant"]), device=device),
         }
+
+
+class Stage1WarmupAgenticUnifiedLoss(nn.Module):
+    """Run original Stage1 loss first, then switch to agentic unified InfoNCE."""
+
+    requires_planner_memory = True
+
+    def __init__(self, cfg: Dict):
+        super().__init__()
+        agentic_cfg = cfg.get("agentic_contrastive", cfg.get("loss", {}).get("agentic_contrastive", {}))
+        self.stage1_warmup_epochs = int(agentic_cfg.get("stage1_warmup_epochs", 30))
+        self.stage1_loss = RFClathLoss(cfg)
+        self.agentic_loss = AgenticUnifiedContrastiveLoss(cfg)
+
+    def _current_epoch(self, outputs: Dict[str, torch.Tensor]) -> int:
+        epoch = outputs.get("epoch", None)
+        if epoch is None:
+            return 1
+        if torch.is_tensor(epoch):
+            return int(epoch.detach().cpu().item())
+        return int(epoch)
+
+    def _with_agentic_defaults(self, losses: Dict[str, torch.Tensor], device: torch.device) -> Dict[str, torch.Tensor]:
+        zero = torch.zeros((), device=device)
+        return {
+            **losses,
+            "component_agentic_contrastive": zero,
+            "loss_arf": zero,
+            "metric_agentic_raw": zero,
+            "metric_agentic_pos_view": zero,
+            "metric_agentic_pos_batch": zero,
+            "metric_agentic_pos_memory": zero,
+            "metric_agentic_pos_arf": zero,
+            "metric_agentic_hard_positive_count": zero,
+            "metric_agentic_hard_negative_count": zero,
+            "metric_agentic_positive_weight_mean": zero,
+            "metric_arf_target_count": zero,
+            "metric_arf_target_mean": zero,
+            "metric_arf_hard_positive_count": zero,
+            "metric_arf_hard_negative_count": zero,
+            "metric_arf_actual_overlap": zero,
+            "metric_arf_false_ratio": zero,
+            "metric_arf_missed_ratio": zero,
+            "metric_arf_retrieved_target_mean": zero,
+            "metric_arf_feedback_weight_mean": zero,
+            "metric_arf_eta_missed": zero,
+            "metric_arf_eta_false": zero,
+            "metric_arf_omega_z": zero,
+            "metric_arf_gamma": zero,
+            "metric_arf_lambda_quant": zero,
+        }
+
+    def forward(self, outputs: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+        epoch = self._current_epoch(outputs)
+        if epoch <= self.stage1_warmup_epochs:
+            return self._with_agentic_defaults(self.stage1_loss(outputs), outputs["u_a"].device)
+        return self.agentic_loss(outputs)
