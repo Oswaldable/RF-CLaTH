@@ -755,9 +755,9 @@ base config: configs/rf_clath_hmdb_hybrid_arf.yaml
 
 | Dataset | Bit | L_ARF | GPU | Status | Launcher PID | Train PID | Train Dir | Launcher Log | Queue Log |
 |---|---:|---:|---:|---|---:|---:|---|---|---|
-| HMDB51 | 16 | 0.02 | cuda0 | running | 499693 | 499702 | `/mnt/disk2/yql/RF-CLaTH_outputs/rf_clath_hybrid_arf_lambda0p02_hmdb_disk2/hmdb_16b_20260610_004604` | `/mnt/disk2/yql/RF-CLaTH_run_logs/rf_clath_hybrid_arf_lambda0p02_hmdb16_cuda0_launcher_20260610_004558.log` | `/mnt/disk2/yql/RF-CLaTH_run_logs/rf_clath_hybrid_arf_lambda0p02_hmdb_disk2_20260610_004558.queue.log` |
-| HMDB51 | 16 | 0.04 | cuda1 | running | 500451 | 500461 | `/mnt/disk2/yql/RF-CLaTH_outputs/rf_clath_hybrid_arf_lambda0p04_hmdb_disk2/hmdb_16b_20260610_004611` | `/mnt/disk2/yql/RF-CLaTH_run_logs/rf_clath_hybrid_arf_lambda0p04_hmdb16_cuda1_launcher_20260610_004608.log` | `/mnt/disk2/yql/RF-CLaTH_run_logs/rf_clath_hybrid_arf_lambda0p04_hmdb_disk2_20260610_004608.queue.log` |
-| HMDB51 | 16 | 0.06 | cuda2 | running | 502138 | 502156 | `/mnt/disk2/yql/RF-CLaTH_outputs/rf_clath_hybrid_arf_lambda0p06_hmdb_disk2/hmdb_16b_20260610_004621` | `/mnt/disk2/yql/RF-CLaTH_run_logs/rf_clath_hybrid_arf_lambda0p06_hmdb16_cuda2_launcher_20260610_004619.log` | `/mnt/disk2/yql/RF-CLaTH_run_logs/rf_clath_hybrid_arf_lambda0p06_hmdb_disk2_20260610_004619.queue.log` |
+| HMDB51 | 16 | 0.02 | cuda0 | completed | 499693 | 499702 | `/mnt/disk2/yql/RF-CLaTH_outputs/rf_clath_hybrid_arf_lambda0p02_hmdb_disk2/hmdb_16b_20260610_004604` | `/mnt/disk2/yql/RF-CLaTH_run_logs/rf_clath_hybrid_arf_lambda0p02_hmdb16_cuda0_launcher_20260610_004558.log` | `/mnt/disk2/yql/RF-CLaTH_run_logs/rf_clath_hybrid_arf_lambda0p02_hmdb_disk2_20260610_004558.queue.log` |
+| HMDB51 | 16 | 0.04 | cuda1 | completed | 500451 | 500461 | `/mnt/disk2/yql/RF-CLaTH_outputs/rf_clath_hybrid_arf_lambda0p04_hmdb_disk2/hmdb_16b_20260610_004611` | `/mnt/disk2/yql/RF-CLaTH_run_logs/rf_clath_hybrid_arf_lambda0p04_hmdb16_cuda1_launcher_20260610_004608.log` | `/mnt/disk2/yql/RF-CLaTH_run_logs/rf_clath_hybrid_arf_lambda0p04_hmdb_disk2_20260610_004608.queue.log` |
+| HMDB51 | 16 | 0.06 | cuda2 | completed | 502138 | 502156 | `/mnt/disk2/yql/RF-CLaTH_outputs/rf_clath_hybrid_arf_lambda0p06_hmdb_disk2/hmdb_16b_20260610_004621` | `/mnt/disk2/yql/RF-CLaTH_run_logs/rf_clath_hybrid_arf_lambda0p06_hmdb16_cuda2_launcher_20260610_004619.log` | `/mnt/disk2/yql/RF-CLaTH_run_logs/rf_clath_hybrid_arf_lambda0p06_hmdb_disk2_20260610_004619.queue.log` |
 
 启动验证：
 
@@ -768,4 +768,102 @@ saved config verified:
   lambda0p04: view=0.30, batch=0.50, arf=0.04
   lambda0p06: view=0.30, batch=0.50, arf=0.06
 all first epoch logs started normally
+```
+
+完成结果：
+
+| Dataset | Bit | L_ARF | Best Epoch | mAP@5 | mAP@20 | mAP@40 | mAP@60 | mAP@80 | mAP@100 | P@100 | R@100 | Final mAP@100 | Notes |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|
+| HMDB51 | 16 | 0.02 | 65 | 0.2996 | 0.2264 | 0.1727 | 0.1372 | 0.1114 | 0.0937 | 0.1677 | 0.2237 | 0.0909 | best in this sweep, but below Stage1 |
+| HMDB51 | 16 | 0.04 | 65 | 0.2990 | 0.2268 | 0.1734 | 0.1382 | 0.1119 | 0.0938 | 0.1670 | 0.2227 | 0.0905 | numerically tied with 0.02; old v1 best was 0.0924 |
+| HMDB51 | 16 | 0.06 | 85 | 0.3101 | 0.2266 | 0.1688 | 0.1344 | 0.1084 | 0.0909 | 0.1621 | 0.2161 | 0.0892 | higher ARF hurts mAP@100 |
+
+结论：
+
+```text
+The lambda sweep did not beat Stage1 HMDB16:
+  Stage1 HMDB16 best mAP@100 = 0.0994
+  best sweep mAP@100 = 0.0938
+
+L_ARF=0.02 and 0.04 are effectively tied.
+L_ARF=0.06 is worse, consistent with v2 showing that too much ARF weakens retrieval.
+```
+
+## 2026-06-10 ARF Memory Contrastive Implementation
+
+目的：按当前分析把 ARF 从 BCE soft-target fitting 改成 contrastive 形式。ARF 不再直接拟合 `P_ij`，只负责提供 memory contrastive 的邻居来源。
+
+新增 objective：
+
+```text
+arf_memory_contrastive
+aliases:
+  contrastive_arf
+  hybrid_contrastive_arf
+```
+
+损失形式：
+
+```text
+L_total =
+  0.30 * L_view
++ 0.50 * L_batch_neighbor
++ lambda_arf * L_ARF_memory_InfoNCE
++ 0.02 * L_quant
++ 0.03 * L_balance
+```
+
+其中 `L_ARF_memory_InfoNCE`：
+
+```text
+positives:
+  Planner top-M 中前 positive_topk 个样本
+  可选加入 planned ∩ actual overlap
+
+denominator:
+  PlannerMemoryBank.u_bank 中全部有效样本，排除 self
+
+hard negatives:
+  actual retrieval 中存在、但 planner 中不存在的样本
+  在 denominator 中乘 hard_negative_weight
+```
+
+默认脚本参数：
+
+```text
+ARF_LAMBDA=0.04
+ARF_POSITIVE_TOPK=10
+ARF_POSITIVE_THRESHOLD=0.0
+ARF_HARD_NEGATIVE_WEIGHT=1.5
+```
+
+新增脚本：
+
+```text
+tools/run_rf_clath_hmdb_arf_memory_contrastive_disk2.sh
+tools/run_rf_clath_ucf_arf_memory_contrastive_disk2.sh
+```
+
+远端验证：
+
+```text
+py_compile: passed
+bash -n: passed
+fake memory-bank forward/backward sanity: passed
+example sanity metrics:
+  loss=1.2858
+  arf_raw=2.3615
+  arf_positive_count=4.19
+  arf_hard_negative_count=4.69
+```
+
+训练日志查看重点：
+
+```text
+arf_raw      = L_ARF_memory_InfoNCE raw value
+arf_targets  = positives per anchor
+arf_hard     = actual-not-planned hard negatives per anchor
+arf_overlap  = planned/actual overlap
+arf_false    = actual retrieval false ratio
+arf_missed   = planned missed by actual ratio
 ```

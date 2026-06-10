@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from typing import Dict, Iterable, Tuple
 
 import torch
@@ -404,4 +405,267 @@ class HybridARFLoss(ARFLoss):
             "loss_semantic": loss_semantic,
             "loss_arf": loss_arf,
             "loss": total,
+        }
+
+
+class ContrastiveARFLoss(HybridARFLoss):
+    """Stage1 contrastive objective with ARF-sourced memory positives.
+
+    ARF is used only as the neighbor source: planner top neighbors become
+    memory-bank positives, actual retrieval misses remain in the denominator as
+    hard negatives, and the loss keeps the InfoNCE competition pressure.
+    """
+
+    requires_planner_memory = True
+
+    def __init__(self, cfg: Dict):
+        super().__init__(cfg)
+        loss_cfg = cfg.get("loss", {})
+        contrast_cfg = cfg.get("arf_contrastive", loss_cfg.get("arf_contrastive", {}))
+        memory_cfg = loss_cfg.get("memory_neighbor", {})
+        default_temperature = float(loss_cfg.get("neighbor_temperature", loss_cfg.get("temperature", 0.2)))
+        self.arf_temperature = float(contrast_cfg.get("temperature", default_temperature))
+        self.arf_positive_topk = int(
+            contrast_cfg.get(
+                "positive_topk",
+                memory_cfg.get("positives_per_anchor", min(10, int(cfg.get("planner", {}).get("top_m", 20)))),
+            )
+        )
+        self.arf_positive_threshold = float(contrast_cfg.get("positive_threshold", 0.0))
+        self.include_planned_actual_overlap = bool(contrast_cfg.get("include_planned_actual_overlap", True))
+        self.fallback_positive_topk = max(1, int(contrast_cfg.get("fallback_positive_topk", 1)))
+        self.hard_negative_weight = max(1.0, float(contrast_cfg.get("hard_negative_weight", 1.0)))
+
+    def _membership(
+        self,
+        target_indices: torch.Tensor,
+        member_indices: torch.Tensor,
+        target_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        if target_indices.numel() == 0 or member_indices.numel() == 0:
+            return torch.zeros_like(target_mask)
+        return (target_indices.unsqueeze(-1) == member_indices.unsqueeze(1)).any(dim=-1) & target_mask
+
+    def _positive_negative_masks(
+        self,
+        targets: Dict[str, torch.Tensor],
+        device: torch.device,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        target_indices = targets["target_indices"].to(device)
+        target_scores = targets["target_scores"].to(device)
+        target_mask = targets["target_mask"].to(device)
+        planned_indices = targets["planned_indices"].to(device)
+        actual_indices = targets["actual_indices"].to(device)
+
+        positive_mask = torch.zeros_like(target_mask)
+        planned_cols = min(target_indices.shape[1], planned_indices.shape[1])
+        if planned_cols > 0:
+            positive_cols = planned_cols if self.arf_positive_topk <= 0 else min(planned_cols, self.arf_positive_topk)
+            planned_positive = target_mask[:, :positive_cols]
+            if self.arf_positive_threshold > 0:
+                planned_positive = planned_positive & (target_scores[:, :positive_cols] >= self.arf_positive_threshold)
+            positive_mask[:, :positive_cols] = planned_positive
+
+        in_planned = self._membership(target_indices, planned_indices, target_mask)
+        in_actual = self._membership(target_indices, actual_indices, target_mask)
+        if self.include_planned_actual_overlap:
+            positive_mask = positive_mask | (in_planned & in_actual)
+
+        if planned_cols > 0:
+            no_positive = ~positive_mask.any(dim=1)
+            fallback_cols = min(planned_cols, self.fallback_positive_topk)
+            fallback = torch.zeros_like(target_mask)
+            fallback[:, :fallback_cols] = target_mask[:, :fallback_cols]
+            positive_mask = positive_mask | (no_positive[:, None] & fallback)
+
+        hard_negative_mask = in_actual & (~in_planned) & (~positive_mask)
+        return positive_mask & target_mask, hard_negative_mask & target_mask
+
+    def _memory_info_nce(
+        self,
+        u: torch.Tensor,
+        memory,
+        sample_indices: torch.Tensor,
+        target_indices: torch.Tensor,
+        positive_mask: torch.Tensor,
+        hard_negative_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        if memory.u_bank is None or u.shape[0] == 0:
+            return u.new_zeros(())
+
+        device = u.device
+        valid_indices = torch.nonzero(memory.u_valid, as_tuple=False).flatten().to(device)
+        if valid_indices.numel() <= 1:
+            return u.new_zeros(())
+
+        sample_indices = sample_indices.to(device=device, dtype=torch.long)
+        target_indices = target_indices.to(device=device, dtype=torch.long)
+        positive_mask = positive_mask.to(device=device, dtype=torch.bool)
+        hard_negative_mask = hard_negative_mask.to(device=device, dtype=torch.bool)
+
+        memory_u = memory.u_bank.index_select(0, valid_indices.to(memory.u_bank.device))
+        memory_u = F.normalize(memory_u.to(device=device, dtype=torch.float32), dim=-1)
+        query = F.normalize(u.float(), dim=-1)
+        logits = query @ memory_u.t()
+        logits = logits / max(self.arf_temperature, 1e-6)
+
+        self_mask = valid_indices.unsqueeze(0) == sample_indices.unsqueeze(1)
+        positive_indices = target_indices.masked_fill(~positive_mask, -1)
+        positive_cols = (positive_indices.unsqueeze(-1) == valid_indices.view(1, 1, -1)).any(dim=1)
+        positive_cols = positive_cols & (~self_mask)
+
+        hard_negative_indices = target_indices.masked_fill(~hard_negative_mask, -1)
+        hard_negative_cols = (hard_negative_indices.unsqueeze(-1) == valid_indices.view(1, 1, -1)).any(dim=1)
+        hard_negative_cols = hard_negative_cols & (~self_mask) & (~positive_cols)
+
+        candidate_mask = ~self_mask
+        valid_rows = positive_cols.any(dim=1) & candidate_mask.any(dim=1)
+        if not bool(valid_rows.any().item()):
+            return u.new_zeros(())
+
+        mask_value = -1e4 if logits.dtype in {torch.float16, torch.bfloat16} else -1e9
+        denom_logits = logits.masked_fill(~candidate_mask, mask_value)
+        if self.hard_negative_weight > 1.0:
+            denom_logits = denom_logits + hard_negative_cols.float() * math.log(self.hard_negative_weight)
+        positive_logits = logits.masked_fill(~positive_cols, mask_value)
+        loss = torch.logsumexp(denom_logits, dim=1) - torch.logsumexp(positive_logits, dim=1)
+        return loss[valid_rows].mean().to(dtype=u.dtype)
+
+    def _trace_contrastive_loss(
+        self,
+        outputs: Dict[str, torch.Tensor],
+        view_key: str,
+        memory,
+        planner,
+        sample_indices: torch.Tensor,
+        schedule: Dict[str, float | bool],
+    ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor], Dict[str, torch.Tensor]]:
+        device = outputs[view_key].device
+        targets = planner.arf_trace_targets(
+            memory,
+            sample_indices,
+            outputs[view_key],
+            top_r=self.top_r,
+            random_anchors=self.random_anchors,
+            use_actual_trace=bool(schedule["use_actual_trace"]),
+            omega_s=float(schedule["omega_s"]),
+            omega_t=float(schedule["omega_t"]),
+            omega_z=float(schedule["omega_z"]),
+            eta_missed=float(schedule["eta_missed"]),
+            eta_false=float(schedule["eta_false"]),
+            weight_clip=self.weight_clip,
+        )
+        positive_mask, hard_negative_mask = self._positive_negative_masks(targets, device)
+        loss = self._memory_info_nce(
+            outputs[view_key],
+            memory,
+            sample_indices,
+            targets["target_indices"].to(device),
+            positive_mask,
+            hard_negative_mask,
+        )
+
+        zero = torch.zeros((), device=device)
+        scores = targets["target_scores"].to(device)
+        positive_count = positive_mask.float().sum(dim=1).mean() if positive_mask.numel() > 0 else zero
+        positive_mean = scores[positive_mask].mean() if positive_mask.any() else zero
+        hard_count = hard_negative_mask.float().sum(dim=1).mean() if hard_negative_mask.numel() > 0 else zero
+        metrics = {
+            "positive_count": positive_count,
+            "positive_mean": positive_mean,
+            "hard_negative_count": hard_count,
+        }
+        return loss, targets, metrics
+
+    def forward(self, outputs: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+        device = outputs["u_a"].device
+        zero = torch.zeros((), device=device)
+        memory = outputs.get("planner_memory", None)
+        planner = outputs.get("graph_planner", None)
+        sample_indices = outputs.get("sample_indices", None)
+        if memory is None or planner is None or sample_indices is None:
+            raise ValueError("ContrastiveARFLoss requires planner_memory, graph_planner, and sample_indices in outputs.")
+
+        epoch_tensor = outputs.get("epoch", torch.ones((), device=device))
+        epoch = int(epoch_tensor.detach().cpu().item()) if torch.is_tensor(epoch_tensor) else int(epoch_tensor)
+        schedule = self._schedule(epoch)
+
+        loss_a, targets_a, trace_metrics_a = self._trace_contrastive_loss(
+            outputs,
+            "u_a",
+            memory,
+            planner,
+            sample_indices,
+            schedule,
+        )
+        loss_b, targets_b, trace_metrics_b = self._trace_contrastive_loss(
+            outputs,
+            "u_b",
+            memory,
+            planner,
+            sample_indices,
+            schedule,
+        )
+        component_arf = 0.5 * (loss_a + loss_b)
+
+        component_view = zero
+        if self.lambda_view > 0:
+            component_view = self.hash_contrast(outputs["u_a"], outputs["u_b"])
+
+        component_batch_neighbor = zero
+        has_neighbors = "neighbor_indices" in outputs
+        if self.lambda_batch_neighbor > 0 and has_neighbors:
+            component_batch_neighbor = self.neighbor_hash_contrast(
+                outputs["u_a"],
+                outputs["u_b"],
+                outputs["sample_indices"],
+                outputs["neighbor_indices"],
+            )
+
+        component_quant = self.quantization(outputs["u_a"], outputs["u_b"])
+        component_bit_balance = self.balance(outputs["u_a"], outputs["u_b"])
+
+        loss_view = self.lambda_view * component_view
+        loss_arf = self.lambda_arf * component_arf
+        loss_semantic = self.lambda_batch_neighbor * component_batch_neighbor + loss_arf
+        loss_hash = (
+            float(schedule["lambda_quant"]) * component_quant
+            + float(schedule["lambda_balance"]) * component_bit_balance
+        )
+        total = loss_view + loss_semantic + loss_hash
+
+        def avg_target_metric(key: str) -> torch.Tensor:
+            a = targets_a[key].to(device) if torch.is_tensor(targets_a[key]) else torch.tensor(targets_a[key], device=device)
+            b = targets_b[key].to(device) if torch.is_tensor(targets_b[key]) else torch.tensor(targets_b[key], device=device)
+            return 0.5 * (a.float() + b.float())
+
+        return {
+            "component_view_contrast": component_view,
+            "component_batch_neighbor": component_batch_neighbor,
+            "component_memory_neighbor": zero,
+            "component_arf_static": component_arf,
+            "component_arf_contrastive": component_arf,
+            "component_quant": component_quant,
+            "component_bit_balance": component_bit_balance,
+            "loss_view": loss_view,
+            "loss_semantic": loss_semantic,
+            "loss_arf": loss_arf,
+            "loss_hash": loss_hash,
+            "loss": total,
+            "metric_arf_target_count": 0.5
+            * (trace_metrics_a["positive_count"].float() + trace_metrics_b["positive_count"].float()),
+            "metric_arf_target_mean": 0.5
+            * (trace_metrics_a["positive_mean"].float() + trace_metrics_b["positive_mean"].float()),
+            "metric_arf_hard_negative_count": 0.5
+            * (trace_metrics_a["hard_negative_count"].float() + trace_metrics_b["hard_negative_count"].float()),
+            "metric_arf_actual_overlap": avg_target_metric("metric_actual_overlap"),
+            "metric_arf_false_ratio": avg_target_metric("metric_false_ratio"),
+            "metric_arf_missed_ratio": avg_target_metric("metric_missed_ratio"),
+            "metric_arf_retrieved_target_mean": avg_target_metric("metric_retrieved_target_mean"),
+            "metric_arf_feedback_weight_mean": avg_target_metric("metric_feedback_weight_mean"),
+            "metric_arf_eta_missed": torch.tensor(float(schedule["eta_missed"]), device=device),
+            "metric_arf_eta_false": torch.tensor(float(schedule["eta_false"]), device=device),
+            "metric_arf_omega_z": torch.tensor(float(schedule["omega_z"]), device=device),
+            "metric_arf_gamma": torch.tensor(float(schedule["gamma"]), device=device),
+            "metric_arf_lambda_quant": torch.tensor(float(schedule["lambda_quant"]), device=device),
         }
