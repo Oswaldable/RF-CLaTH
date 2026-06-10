@@ -1,6 +1,6 @@
 # RF-CLaTH Experiment Log
 
-更新时间：2026-06-09 18:48，时区 Asia/Shanghai。
+更新时间：2026-06-10，时区 Asia/Shanghai。
 
 记录规则：
 
@@ -26,8 +26,8 @@ launcher pid: 1135399
 active train pid: 715494
 remote launcher log: /mnt/disk2/yql/RF-CLaTH_run_logs/rf_clath_t_sas_ucf_cuda1_launcher_20260608_141126.log
 remote queue log: /mnt/disk2/yql/RF-CLaTH_run_logs/rf_clath_t_sas_ucf_disk2_20260608_141126.queue.log
-status: 16/32-bit completed; 64-bit running
-latest eval: 64-bit epoch 25, mAP@5=0.8008, mAP@20=0.6330, mAP@100=0.3987
+status: completed 16/32/64-bit
+latest eval: 64-bit epoch 150, mAP@5=0.7902, mAP@20=0.6470, mAP@100=0.4072
 ```
 
 结果记录：
@@ -36,7 +36,7 @@ latest eval: 64-bit epoch 25, mAP@5=0.8008, mAP@20=0.6330, mAP@100=0.3987
 |---:|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|
 | 16 | /mnt/disk2/yql/RF-CLaTH_outputs/rf_clath_t_sas_ucf_disk2/s5vh_ucf_16b_20260608_141136 | /mnt/disk2/yql/RF-CLaTH_outputs/rf_clath_t_sas_ucf_disk2/s5vh_ucf_16b_20260608_141136/best.pth | 70 | 0.6782 | 0.5820 | 0.5159 | 0.4550 | 0.3980 | 0.3434 | 0.7214 | 0.6462 | 0.4143 | 0.0361 | 0.1288 | 0.4109 | completed; final epoch 150 mAP@100=0.3410 |
 | 32 | /mnt/disk2/yql/RF-CLaTH_outputs/rf_clath_t_sas_ucf_disk2/s5vh_ucf_32b_20260608_223349 | /mnt/disk2/yql/RF-CLaTH_outputs/rf_clath_t_sas_ucf_disk2/s5vh_ucf_32b_20260608_223349/best.pth | 60 | 0.7579 | 0.6324 | 0.5593 | 0.5027 | 0.4458 | 0.3888 | 0.7869 | 0.6823 | 0.4573 | 0.0395 | 0.1363 | 0.4523 | completed; final epoch 150 mAP@100=0.3831 |
-| 64 | /mnt/disk2/yql/RF-CLaTH_outputs/rf_clath_t_sas_ucf_disk2/s5vh_ucf_64b_20260609_084849 | TBD | 25 | 0.8008 | 0.6330 | 0.5563 | 0.5027 | 0.4508 | 0.3987 | 0.8177 | 0.6757 | 0.4703 | 0.0410 | 0.1350 | 0.4637 | running; latest epoch 25/150, not a completed result |
+| 64 | /mnt/disk2/yql/RF-CLaTH_outputs/rf_clath_t_sas_ucf_disk2/s5vh_ucf_64b_20260609_084849 | /mnt/disk2/yql/RF-CLaTH_outputs/rf_clath_t_sas_ucf_disk2/s5vh_ucf_64b_20260609_084849/best.pth | 85 | 0.7960 | 0.6510 | 0.5713 | 0.5158 | 0.4632 | 0.4075 | 0.8154 | 0.6945 | 0.4788 | 0.0409 | 0.1389 | 0.4737 | completed; final epoch 150 mAP@100=0.4072 |
 
 ### HMDB51 16/32/64-bit
 
@@ -99,6 +99,7 @@ Only fully completed runs are included in this snapshot.
 |---|---|---:|---:|---:|---:|---|
 | UCF101 | T-SAS + original loss | 16 | 70 | 0.3434 | 0.3410 | completed |
 | UCF101 | T-SAS + original loss | 32 | 60 | 0.3888 | 0.3831 | completed |
+| UCF101 | T-SAS + original loss | 64 | 85 | 0.4075 | 0.4072 | completed |
 | HMDB51 | T-SAS + original loss | 16 | 65 | 0.0994 | 0.0952 | completed |
 | HMDB51 | T-SAS + original loss | 32 | 100 | 0.1134 | 0.1122 | completed |
 | HMDB51 | T-SAS + original loss | 64 | 100 | 0.1273 | 0.1257 | completed |
@@ -570,4 +571,201 @@ arf_overlap / arf_false / arf_missed / arf_retrieved / arf_weight:
 mAP@100:
   UCF16 先对比 Stage1 T-SAS best 0.3434
   HMDB16 先对比 Stage1 T-SAS best 0.0994
+```
+
+## 2026-06-09 Stage5 Hybrid ARF Replacing Memory Neighbor
+
+目的：如果纯 Full ARF 作为主监督不稳定，验证更保守的 hybrid 方案：
+保留 Stage1 的 view contrastive 和 batch neighbor contrastive，把旧的 memory neighbor contrastive 替换为 Full ARF trace-fitting。
+
+当前损失：
+
+```text
+L_total =
+  0.30 * L_view
++ 0.50 * L_batch_neighbor
++ 0.04 * L_ARF
++ 0.02 * L_quant
++ 0.03 * L_balance
+
+L_memory_neighbor = 0
+late_sharpen disabled for isolation
+```
+
+代码/配置：
+
+```text
+losses/arf_loss.py
+  HybridARFLoss
+
+engine/train.py
+  objective=hybrid_arf / arf_hybrid / contrastive_arf
+
+configs/rf_clath_hmdb_hybrid_arf.yaml
+tools/run_rf_clath_hmdb_hybrid_arf_disk2.sh
+```
+
+启动任务：
+
+| Dataset | Bit | GPU | Status | Launcher PID | Train PID | Train Dir | Launcher Log | Queue Log |
+|---|---:|---:|---|---:|---:|---|---|---|
+| HMDB51 | 16 | cuda3 | running | 2418847 | 2418868 | `/mnt/disk2/yql/RF-CLaTH_outputs/rf_clath_hybrid_arf_hmdb_disk2/hmdb_16b_20260609_133200` | `/mnt/disk2/yql/RF-CLaTH_run_logs/rf_clath_hybrid_arf_hmdb16_cuda3_launcher_20260609_133157.log` | `/mnt/disk2/yql/RF-CLaTH_run_logs/rf_clath_hybrid_arf_hmdb_disk2_20260609_133157.queue.log` |
+
+启动验证：
+
+```text
+remote py_compile passed
+bash -n passed
+saved config objective=hybrid_arf, hash_bits=16
+cuda3 was already shared with AutoSSVH FCV64; memory after launch about 15.3GB / 32GB
+```
+
+对比目标：
+
+```text
+HMDB16 Stage1 T-SAS best mAP@100: 0.0994
+HMDB16 Full ARF official launch: running separately on cuda2
+```
+
+## 2026-06-09 Stage5 Full ARF Stop
+
+停止原因：纯 Full ARF 当前明显低于 Stage1，并且 HMDB Hybrid ARF 已经超过纯 Full ARF，同步释放 cuda0/cuda2。
+
+停止口径：
+
+```text
+TERM matched:
+  tools/run_rf_clath_ucf_full_arf_disk2.sh
+  configs/rf_clath_ucf_full_arf.yaml
+  tools/run_rf_clath_hmdb_full_arf_disk2.sh
+  configs/rf_clath_hmdb_full_arf.yaml
+```
+
+停止前最好指标：
+
+| Dataset | Bit | Experiment | Best Epoch | Best mAP@100 | Status |
+|---|---:|---|---:|---:|---|
+| UCF101 | 16 | Full ARF | 20 | 0.1390 | stopped |
+| HMDB51 | 16 | Full ARF | 45 | 0.0394 | stopped |
+
+保留运行：
+
+| Dataset | Bit | Experiment | GPU | Train Dir | Status |
+|---|---:|---|---:|---|---|
+| HMDB51 | 16 | Hybrid ARF replacing memory neighbor | cuda3 | `/mnt/disk2/yql/RF-CLaTH_outputs/rf_clath_hybrid_arf_hmdb_disk2/hmdb_16b_20260609_133200` | completed |
+
+## 2026-06-09 Stage5 Hybrid ARF v2 and ARF-only v3 Launch
+
+目的：继续拆分 ARF 的有效性：
+
+```text
+v2:
+  降低 batch neighbor，增强 ARF
+
+v3:
+  去掉 view / batch neighbor / memory neighbor / quant / balance
+  只保留 L_ARF
+```
+
+代码/脚本：
+
+```text
+tools/run_rf_clath_hmdb_hybrid_arf_v2_disk2.sh
+  base config: configs/rf_clath_hmdb_hybrid_arf.yaml
+  overrides:
+    loss.semantic.lambda_batch_neighbor=0.3
+    loss_weights.lambda_arf=0.08
+    loss.arf.lambda=0.08
+
+tools/run_rf_clath_hmdb_arf_only_v3_disk2.sh
+  base config: configs/rf_clath_hmdb_full_arf.yaml
+  overrides:
+    loss_weights.lambda_quant=0.0
+    loss_weights.lambda_balance=0.0
+    arf_loss.late_sharpen.start_ratio=1.10
+    arf_loss.late_sharpen.lambda_quant=0.0
+    arf_loss.late_sharpen.lambda_balance=0.0
+```
+
+实际损失：
+
+```text
+v2:
+  L_total =
+    0.30 * L_view
+  + 0.30 * L_batch_neighbor
+  + 0.08 * L_ARF
+  + 0.02 * L_quant
+  + 0.03 * L_balance
+
+v3:
+  L_total = 1.00 * L_ARF
+```
+
+启动任务：
+
+| Dataset | Bit | Experiment | GPU | Status | Launcher PID | Train PID | Train Dir | Launcher Log | Queue Log |
+|---|---:|---|---:|---|---:|---:|---|---|---|
+| HMDB51 | 16 | Hybrid ARF v2 | cuda0 | completed | 2592850 | 2592858 | `/mnt/disk2/yql/RF-CLaTH_outputs/rf_clath_hybrid_arf_v2_hmdb_disk2/hmdb_16b_20260609_140921` | `/mnt/disk2/yql/RF-CLaTH_run_logs/rf_clath_hybrid_arf_v2_hmdb16_cuda0_launcher_20260609_140910.log` | `/mnt/disk2/yql/RF-CLaTH_run_logs/rf_clath_hybrid_arf_v2_hmdb_disk2_20260609_140910.queue.log` |
+| HMDB51 | 16 | ARF-only v3 | cuda2 | completed | 2594100 | 2594108 | `/mnt/disk2/yql/RF-CLaTH_outputs/rf_clath_arf_only_v3_hmdb_disk2/hmdb_16b_20260609_140921` | `/mnt/disk2/yql/RF-CLaTH_run_logs/rf_clath_arf_only_v3_hmdb16_cuda2_launcher_20260609_140919.log` | `/mnt/disk2/yql/RF-CLaTH_run_logs/rf_clath_arf_only_v3_hmdb_disk2_20260609_140920.queue.log` |
+
+启动验证：
+
+```text
+bash -n passed for both scripts
+saved config verified for both runs
+```
+
+完成结果：
+
+| Dataset | Bit | Experiment | Best Epoch | mAP@5 | mAP@20 | mAP@40 | mAP@60 | mAP@80 | mAP@100 | P@100 | R@100 | Final mAP@100 | Notes |
+|---|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|
+| HMDB51 | 16 | Hybrid ARF v1, replace memory neighbor | 85 | 0.3120 | 0.2324 | 0.1737 | 0.1364 | 0.1102 | 0.0924 | 0.1633 | 0.2178 | 0.0908 | close to Stage1 HMDB16 but still lower |
+| HMDB51 | 16 | Hybrid ARF v2, lower batch / higher ARF | 135 | 0.3004 | 0.2114 | 0.1537 | 0.1196 | 0.0956 | 0.0802 | 0.1480 | 0.1973 | 0.0792 | worse than v1; ARF weight too high or batch too low |
+| HMDB51 | 16 | ARF-only v3 | 120 | 0.1796 | 0.1016 | 0.0693 | 0.0540 | 0.0449 | 0.0392 | 0.1116 | 0.1489 | 0.0379 | confirms ARF-only is insufficient |
+
+## 2026-06-10 Stage5 Hybrid ARF Lambda Sweep
+
+目的：围绕 v1 的有效区域继续细调，只改变 `L_ARF` 权重；固定 view/batch contrastive，避免再次削弱主监督。
+
+固定损失：
+
+```text
+L_view = 0.30
+L_batch_neighbor = 0.50
+L_memory_neighbor = 0
+L_quant = 0.02
+L_balance = 0.03
+```
+
+变量：
+
+```text
+L_ARF = 0.02 / 0.04 / 0.06
+```
+
+代码/脚本：
+
+```text
+tools/run_rf_clath_hmdb_hybrid_arf_lambda_disk2.sh
+base config: configs/rf_clath_hmdb_hybrid_arf.yaml
+```
+
+启动任务：
+
+| Dataset | Bit | L_ARF | GPU | Status | Launcher PID | Train PID | Train Dir | Launcher Log | Queue Log |
+|---|---:|---:|---:|---|---:|---:|---|---|---|
+| HMDB51 | 16 | 0.02 | cuda0 | running | 499693 | 499702 | `/mnt/disk2/yql/RF-CLaTH_outputs/rf_clath_hybrid_arf_lambda0p02_hmdb_disk2/hmdb_16b_20260610_004604` | `/mnt/disk2/yql/RF-CLaTH_run_logs/rf_clath_hybrid_arf_lambda0p02_hmdb16_cuda0_launcher_20260610_004558.log` | `/mnt/disk2/yql/RF-CLaTH_run_logs/rf_clath_hybrid_arf_lambda0p02_hmdb_disk2_20260610_004558.queue.log` |
+| HMDB51 | 16 | 0.04 | cuda1 | running | 500451 | 500461 | `/mnt/disk2/yql/RF-CLaTH_outputs/rf_clath_hybrid_arf_lambda0p04_hmdb_disk2/hmdb_16b_20260610_004611` | `/mnt/disk2/yql/RF-CLaTH_run_logs/rf_clath_hybrid_arf_lambda0p04_hmdb16_cuda1_launcher_20260610_004608.log` | `/mnt/disk2/yql/RF-CLaTH_run_logs/rf_clath_hybrid_arf_lambda0p04_hmdb_disk2_20260610_004608.queue.log` |
+| HMDB51 | 16 | 0.06 | cuda2 | running | 502138 | 502156 | `/mnt/disk2/yql/RF-CLaTH_outputs/rf_clath_hybrid_arf_lambda0p06_hmdb_disk2/hmdb_16b_20260610_004621` | `/mnt/disk2/yql/RF-CLaTH_run_logs/rf_clath_hybrid_arf_lambda0p06_hmdb16_cuda2_launcher_20260610_004619.log` | `/mnt/disk2/yql/RF-CLaTH_run_logs/rf_clath_hybrid_arf_lambda0p06_hmdb_disk2_20260610_004619.queue.log` |
+
+启动验证：
+
+```text
+bash -n passed
+saved config verified:
+  lambda0p02: view=0.30, batch=0.50, arf=0.02
+  lambda0p04: view=0.30, batch=0.50, arf=0.04
+  lambda0p06: view=0.30, batch=0.50, arf=0.06
+all first epoch logs started normally
 ```
