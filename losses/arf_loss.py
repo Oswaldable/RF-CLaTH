@@ -710,3 +710,362 @@ class ContrastiveARFLoss(HybridARFLoss):
             "metric_arf_gamma": torch.tensor(float(schedule["gamma"]), device=device),
             "metric_arf_lambda_quant": torch.tensor(float(schedule["lambda_quant"]), device=device),
         }
+
+
+class AgenticUnifiedContrastiveLoss(ContrastiveARFLoss):
+    """Single source-aware InfoNCE objective for Stage1 + ARF feedback.
+
+    The loss uses one candidate pool for both current-batch embeddings and the
+    planner memory bank. Different supervision signals only contribute source
+    weights to the same positive matrix; ARF false retrievals add denominator
+    weight as hard negatives.
+    """
+
+    requires_planner_memory = True
+
+    def __init__(self, cfg: Dict):
+        super().__init__(cfg)
+        loss_cfg = cfg.get("loss", {})
+        agentic_cfg = cfg.get("agentic_contrastive", loss_cfg.get("agentic_contrastive", {}))
+        source_cfg = agentic_cfg.get("source_weights", {})
+        memory_cfg = loss_cfg.get("memory_neighbor", {})
+        default_temperature = float(loss_cfg.get("neighbor_temperature", loss_cfg.get("temperature", 0.2)))
+
+        self.agentic_temperature = float(agentic_cfg.get("temperature", default_temperature))
+        self.memory_positive_topk = max(
+            1,
+            int(agentic_cfg.get("memory_positive_topk", memory_cfg.get("positives_per_anchor", 10))),
+        )
+        self.arf_positive_topk = int(agentic_cfg.get("arf_positive_topk", self.arf_positive_topk))
+        self.actual_trace_start_epoch = int(agentic_cfg.get("actual_trace_start_epoch", 30))
+        self.hard_mining_start_epoch = int(agentic_cfg.get("hard_mining_start_epoch", 30))
+        self.normalize_sources = bool(agentic_cfg.get("normalize_sources", True))
+        self.max_positive_weight = float(agentic_cfg.get("max_positive_weight", 2.0))
+        self.source_weight_view = float(source_cfg.get("view", 1.0))
+        self.source_weight_batch = float(source_cfg.get("batch_neighbor", 0.75))
+        self.source_weight_memory = float(source_cfg.get("memory_neighbor", 0.25))
+        self.source_weight_arf = float(source_cfg.get("arf_planned", 0.25))
+        self.source_weight_missed_bonus = float(source_cfg.get("arf_missed_bonus", 0.25))
+        self.hard_negative_weight = max(1.0, float(agentic_cfg.get("hard_negative_weight", 1.25)))
+
+    def _source_addition(self, mask: torch.Tensor, weight: float) -> torch.Tensor:
+        if weight <= 0 or mask.numel() == 0:
+            return mask.float() * 0.0
+        mask_f = mask.float()
+        if self.normalize_sources:
+            denom = mask_f.sum(dim=1, keepdim=True).clamp_min(1.0)
+            return mask_f * (float(weight) / denom)
+        return mask_f * float(weight)
+
+    def _batch_neighbor_mask(
+        self,
+        sample_indices: torch.Tensor,
+        neighbor_indices: torch.Tensor,
+        query_base: torch.Tensor,
+        candidate_base: torch.Tensor,
+    ) -> torch.Tensor:
+        batch_size = sample_indices.shape[0]
+        if neighbor_indices.numel() == 0:
+            return torch.zeros(
+                query_base.shape[0],
+                candidate_base.shape[0],
+                dtype=torch.bool,
+                device=sample_indices.device,
+            )
+        base = (neighbor_indices[:, :, None] == sample_indices[None, None, :]).any(dim=1)
+        if bool(getattr(self.neighbor_hash_contrast.nt_xent, "symmetric_neighbors", True)):
+            base = base | base.t()
+        base = base & (~torch.eye(batch_size, dtype=torch.bool, device=sample_indices.device))
+        return base[query_base[:, None], candidate_base[None, :]]
+
+    def _memory_neighbor_mask(
+        self,
+        sample_indices: torch.Tensor,
+        neighbor_indices: torch.Tensor,
+        query_base: torch.Tensor,
+        valid_indices: torch.Tensor,
+    ) -> torch.Tensor:
+        if valid_indices.numel() == 0 or neighbor_indices.numel() == 0:
+            return torch.zeros(query_base.shape[0], valid_indices.shape[0], dtype=torch.bool, device=sample_indices.device)
+        topk = min(self.memory_positive_topk, neighbor_indices.shape[1])
+        neighbors = neighbor_indices[:, :topk].long()
+        base = (neighbors[:, :, None] == valid_indices[None, None, :]).any(dim=1)
+        base = base & (valid_indices[None, :] != sample_indices[:, None])
+        return base[query_base]
+
+    def _target_columns(
+        self,
+        target_indices: torch.Tensor,
+        target_mask: torch.Tensor,
+        valid_indices: torch.Tensor,
+    ) -> torch.Tensor:
+        if valid_indices.numel() == 0 or target_indices.numel() == 0:
+            return torch.zeros(target_indices.shape[0], valid_indices.shape[0], dtype=torch.bool, device=target_indices.device)
+        masked = target_indices.long().masked_fill(~target_mask, -1)
+        return (masked.unsqueeze(-1) == valid_indices.view(1, 1, -1)).any(dim=1)
+
+    def _trace_masks_for_view(
+        self,
+        outputs: Dict[str, torch.Tensor],
+        view_key: str,
+        memory,
+        planner,
+        sample_indices: torch.Tensor,
+        valid_indices: torch.Tensor,
+        schedule: Dict[str, float | bool],
+        hard_mining_enabled: bool,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Dict[str, torch.Tensor], Dict[str, torch.Tensor]]:
+        device = outputs[view_key].device
+        targets = planner.arf_trace_targets(
+            memory,
+            sample_indices,
+            outputs[view_key],
+            top_r=self.top_r,
+            random_anchors=self.random_anchors,
+            use_actual_trace=bool(schedule["use_actual_trace"]),
+            omega_s=float(schedule["omega_s"]),
+            omega_t=float(schedule["omega_t"]),
+            omega_z=float(schedule["omega_z"]),
+            eta_missed=float(schedule["eta_missed"]),
+            eta_false=float(schedule["eta_false"]),
+            weight_clip=self.weight_clip,
+        )
+        positive_mask, hard_positive_mask, hard_negative_mask = self._positive_negative_masks(
+            targets,
+            device,
+            hard_mining_enabled=hard_mining_enabled,
+        )
+        target_indices = targets["target_indices"].to(device)
+        arf_cols = self._target_columns(target_indices, positive_mask.to(device), valid_indices)
+        hard_pos_cols = self._target_columns(target_indices, hard_positive_mask.to(device), valid_indices)
+        hard_neg_cols = self._target_columns(target_indices, hard_negative_mask.to(device), valid_indices)
+        zero = torch.zeros((), device=device)
+        target_scores = targets["target_scores"].to(device)
+        metrics = {
+            "positive_count": positive_mask.float().sum(dim=1).mean() if positive_mask.numel() > 0 else zero,
+            "positive_mean": target_scores[positive_mask.to(device)].mean()
+            if positive_mask.numel() > 0 and positive_mask.to(device).any()
+            else zero,
+            "hard_positive_count": hard_positive_mask.float().sum(dim=1).mean() if hard_positive_mask.numel() > 0 else zero,
+            "hard_negative_count": hard_negative_mask.float().sum(dim=1).mean() if hard_negative_mask.numel() > 0 else zero,
+        }
+        return arf_cols, hard_pos_cols, hard_neg_cols, targets, metrics
+
+    def _unified_info_nce(
+        self,
+        outputs: Dict[str, torch.Tensor],
+        memory,
+        planner,
+        sample_indices: torch.Tensor,
+        neighbor_indices: torch.Tensor,
+        schedule: Dict[str, float | bool],
+        hard_mining_enabled: bool,
+    ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+        device = outputs["u_a"].device
+        batch_size = outputs["u_a"].shape[0]
+        query = F.normalize(torch.cat([outputs["u_a"], outputs["u_b"]], dim=0).float(), dim=-1)
+        query_count = query.shape[0]
+
+        valid_indices_mem = torch.nonzero(memory.u_valid, as_tuple=False).flatten()
+        if valid_indices_mem.numel() > 0:
+            memory_u = memory.u_bank.index_select(0, valid_indices_mem)
+            memory_u = F.normalize(memory_u.to(device=device, dtype=torch.float32), dim=-1)
+            valid_indices = valid_indices_mem.to(device=device, dtype=torch.long)
+        else:
+            memory_u = query.new_empty(0, query.shape[-1])
+            valid_indices = torch.empty(0, dtype=torch.long, device=device)
+
+        batch_logits = query @ query.t()
+        memory_logits = query @ memory_u.t() if valid_indices.numel() > 0 else query.new_empty(query_count, 0)
+        logits = torch.cat([batch_logits, memory_logits], dim=1) / max(self.agentic_temperature, 1e-6)
+
+        sample_indices = sample_indices.to(device=device, dtype=torch.long)
+        neighbor_indices = neighbor_indices.to(device=device, dtype=torch.long)
+        query_base = torch.arange(query_count, device=device) % batch_size
+        candidate_base = torch.arange(query_count, device=device) % batch_size
+        query_sample_ids = sample_indices[query_base]
+
+        batch_self_mask = torch.eye(query_count, dtype=torch.bool, device=device)
+        batch_candidate_mask = ~batch_self_mask
+        if valid_indices.numel() > 0:
+            memory_self_mask = valid_indices.unsqueeze(0) == query_sample_ids.unsqueeze(1)
+            memory_candidate_mask = ~memory_self_mask
+        else:
+            memory_candidate_mask = torch.zeros(query_count, 0, dtype=torch.bool, device=device)
+        candidate_mask = torch.cat([batch_candidate_mask, memory_candidate_mask], dim=1)
+
+        view_mask = sample_indices[query_base].unsqueeze(1) == sample_indices[candidate_base].unsqueeze(0)
+        view_mask = view_mask & batch_candidate_mask
+        batch_neighbor_mask = self._batch_neighbor_mask(sample_indices, neighbor_indices, query_base, candidate_base)
+        batch_neighbor_mask = batch_neighbor_mask & batch_candidate_mask
+        memory_neighbor_mask = self._memory_neighbor_mask(sample_indices, neighbor_indices, query_base, valid_indices)
+        memory_neighbor_mask = memory_neighbor_mask & memory_candidate_mask
+
+        arf_a, hpos_a, hneg_a, targets_a, metrics_a = self._trace_masks_for_view(
+            outputs,
+            "u_a",
+            memory,
+            planner,
+            sample_indices,
+            valid_indices,
+            schedule,
+            hard_mining_enabled,
+        )
+        arf_b, hpos_b, hneg_b, targets_b, metrics_b = self._trace_masks_for_view(
+            outputs,
+            "u_b",
+            memory,
+            planner,
+            sample_indices,
+            valid_indices,
+            schedule,
+            hard_mining_enabled,
+        )
+        arf_mask = torch.cat([arf_a, arf_b], dim=0) & memory_candidate_mask
+        hard_positive_mask = torch.cat([hpos_a, hpos_b], dim=0) & memory_candidate_mask
+        hard_negative_mask = torch.cat([hneg_a, hneg_b], dim=0) & memory_candidate_mask
+
+        positive_weights = torch.zeros_like(logits, dtype=torch.float32)
+        positive_weights[:, :query_count] += self._source_addition(view_mask, self.source_weight_view)
+        positive_weights[:, :query_count] += self._source_addition(batch_neighbor_mask, self.source_weight_batch)
+        if valid_indices.numel() > 0:
+            positive_weights[:, query_count:] += self._source_addition(memory_neighbor_mask, self.source_weight_memory)
+            positive_weights[:, query_count:] += self._source_addition(arf_mask, self.source_weight_arf)
+            positive_weights[:, query_count:] += self._source_addition(hard_positive_mask, self.source_weight_missed_bonus)
+        positive_weights = torch.clamp(positive_weights, min=0.0, max=self.max_positive_weight)
+        positive_weights = positive_weights * candidate_mask.float()
+
+        valid_rows = (positive_weights > 0).any(dim=1) & candidate_mask.any(dim=1)
+        if not bool(valid_rows.any().item()):
+            return query.new_zeros(()), {
+                "targets_a": targets_a,
+                "targets_b": targets_b,
+                "metrics_a": metrics_a,
+                "metrics_b": metrics_b,
+                "view_count": query.new_zeros(()),
+                "batch_count": query.new_zeros(()),
+                "memory_count": query.new_zeros(()),
+                "arf_count": query.new_zeros(()),
+                "hard_positive_count": query.new_zeros(()),
+                "hard_negative_count": query.new_zeros(()),
+                "positive_weight": query.new_zeros(()),
+            }
+
+        mask_value = -1e4 if logits.dtype in {torch.float16, torch.bfloat16} else -1e9
+        denom_logits = logits.masked_fill(~candidate_mask, mask_value)
+        if self.hard_negative_weight > 1.0 and valid_indices.numel() > 0:
+            denom_bonus = torch.zeros_like(logits)
+            denom_bonus[:, query_count:] = hard_negative_mask.float() * math.log(self.hard_negative_weight)
+            denom_logits = denom_logits + denom_bonus
+        positive_logits = logits + torch.log(positive_weights.clamp_min(1e-12))
+        positive_logits = positive_logits.masked_fill(positive_weights <= 0, mask_value)
+        loss = torch.logsumexp(denom_logits, dim=1) - torch.logsumexp(positive_logits, dim=1)
+
+        pos_active = positive_weights > 0
+        metrics = {
+            "targets_a": targets_a,
+            "targets_b": targets_b,
+            "metrics_a": metrics_a,
+            "metrics_b": metrics_b,
+            "view_count": view_mask.float().sum(dim=1).mean(),
+            "batch_count": batch_neighbor_mask.float().sum(dim=1).mean(),
+            "memory_count": memory_neighbor_mask.float().sum(dim=1).mean() if valid_indices.numel() > 0 else query.new_zeros(()),
+            "arf_count": arf_mask.float().sum(dim=1).mean() if valid_indices.numel() > 0 else query.new_zeros(()),
+            "hard_positive_count": hard_positive_mask.float().sum(dim=1).mean()
+            if valid_indices.numel() > 0
+            else query.new_zeros(()),
+            "hard_negative_count": hard_negative_mask.float().sum(dim=1).mean()
+            if valid_indices.numel() > 0
+            else query.new_zeros(()),
+            "positive_weight": positive_weights[pos_active].mean() if pos_active.any() else query.new_zeros(()),
+        }
+        return loss[valid_rows].mean().to(dtype=outputs["u_a"].dtype), metrics
+
+    def forward(self, outputs: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+        device = outputs["u_a"].device
+        zero = torch.zeros((), device=device)
+        memory = outputs.get("planner_memory", None)
+        planner = outputs.get("graph_planner", None)
+        sample_indices = outputs.get("sample_indices", None)
+        neighbor_indices = outputs.get("neighbor_indices", None)
+        if memory is None or planner is None or sample_indices is None or neighbor_indices is None:
+            raise ValueError(
+                "AgenticUnifiedContrastiveLoss requires planner_memory, graph_planner, sample_indices, and neighbor_indices."
+            )
+
+        epoch_tensor = outputs.get("epoch", torch.ones((), device=device))
+        epoch = int(epoch_tensor.detach().cpu().item()) if torch.is_tensor(epoch_tensor) else int(epoch_tensor)
+        schedule = self._schedule(epoch)
+        if self.actual_trace_start_epoch > 0 and epoch < self.actual_trace_start_epoch:
+            schedule = dict(schedule)
+            schedule["use_actual_trace"] = False
+            schedule["eta_missed"] = 0.0
+            schedule["eta_false"] = 0.0
+        hard_mining_enabled = bool(schedule["use_actual_trace"]) and (
+            self.hard_mining_start_epoch <= 0 or epoch >= self.hard_mining_start_epoch
+        )
+
+        component_agentic, metrics = self._unified_info_nce(
+            outputs,
+            memory,
+            planner,
+            sample_indices,
+            neighbor_indices,
+            schedule,
+            hard_mining_enabled,
+        )
+        component_quant = self.quantization(outputs["u_a"], outputs["u_b"])
+        component_bit_balance = self.balance(outputs["u_a"], outputs["u_b"])
+        loss_hash = (
+            float(schedule["lambda_quant"]) * component_quant
+            + float(schedule["lambda_balance"]) * component_bit_balance
+        )
+        total = component_agentic + loss_hash
+
+        targets_a = metrics["targets_a"]
+        targets_b = metrics["targets_b"]
+
+        def avg_target_metric(key: str) -> torch.Tensor:
+            a = targets_a[key].to(device) if torch.is_tensor(targets_a[key]) else torch.tensor(targets_a[key], device=device)
+            b = targets_b[key].to(device) if torch.is_tensor(targets_b[key]) else torch.tensor(targets_b[key], device=device)
+            return 0.5 * (a.float() + b.float())
+
+        return {
+            "component_view_contrast": zero,
+            "component_batch_neighbor": zero,
+            "component_memory_neighbor": zero,
+            "component_arf_static": zero,
+            "component_arf_contrastive": zero,
+            "component_agentic_contrastive": component_agentic,
+            "component_quant": component_quant,
+            "component_bit_balance": component_bit_balance,
+            "loss_view": zero,
+            "loss_semantic": component_agentic,
+            "loss_arf": zero,
+            "loss_hash": loss_hash,
+            "loss": total,
+            "metric_agentic_raw": component_agentic.detach(),
+            "metric_agentic_pos_view": metrics["view_count"],
+            "metric_agentic_pos_batch": metrics["batch_count"],
+            "metric_agentic_pos_memory": metrics["memory_count"],
+            "metric_agentic_pos_arf": metrics["arf_count"],
+            "metric_agentic_hard_positive_count": metrics["hard_positive_count"],
+            "metric_agentic_hard_negative_count": metrics["hard_negative_count"],
+            "metric_agentic_positive_weight_mean": metrics["positive_weight"],
+            "metric_arf_target_count": 0.5
+            * (metrics["metrics_a"]["positive_count"].float() + metrics["metrics_b"]["positive_count"].float()),
+            "metric_arf_target_mean": 0.5
+            * (metrics["metrics_a"]["positive_mean"].float() + metrics["metrics_b"]["positive_mean"].float()),
+            "metric_arf_hard_positive_count": metrics["hard_positive_count"],
+            "metric_arf_hard_negative_count": metrics["hard_negative_count"],
+            "metric_arf_actual_overlap": avg_target_metric("metric_actual_overlap"),
+            "metric_arf_false_ratio": avg_target_metric("metric_false_ratio"),
+            "metric_arf_missed_ratio": avg_target_metric("metric_missed_ratio"),
+            "metric_arf_retrieved_target_mean": avg_target_metric("metric_retrieved_target_mean"),
+            "metric_arf_feedback_weight_mean": avg_target_metric("metric_feedback_weight_mean"),
+            "metric_arf_eta_missed": torch.tensor(float(schedule["eta_missed"]), device=device),
+            "metric_arf_eta_false": torch.tensor(float(schedule["eta_false"]), device=device),
+            "metric_arf_omega_z": torch.tensor(float(schedule["omega_z"]), device=device),
+            "metric_arf_gamma": torch.tensor(float(schedule["gamma"]), device=device),
+            "metric_arf_lambda_quant": torch.tensor(float(schedule["lambda_quant"]), device=device),
+        }

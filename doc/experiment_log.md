@@ -916,3 +916,79 @@ C first epochs:
   arf_hpos=0.0
   arf_hard=0.0
 ```
+
+## 2026-06-10 Agentic Unified Contrastive v1
+
+目的：把 Stage1 的 `L_view / L_batch_neighbor / L_memory_neighbor` 和 ARF 的 planned/actual feedback 融合成一个 source-aware InfoNCE，而不是多个 contrastive loss 外层相加。
+
+实现口径：
+
+```text
+objective: agentic_unified_contrastive
+
+L_total =
+  L_agentic_unified_contrastive
++ 0.02 * L_quant
++ 0.03 * L_balance
+
+candidate pool:
+  current batch two-view candidates
+  valid PlannerMemoryBank.u_bank entries
+
+positive sources:
+  paired view same video:              1.00
+  batch raw-feature neighbor:          0.75
+  memory raw-feature neighbor top10:   0.25
+  planner planned/overlap positive:    0.25
+  missed hard positive bonus:          0.25
+
+hard negative:
+  actual-not-planned denominator weight = 1.25
+
+curriculum:
+  actual_trace_start_epoch = 30
+  hard_mining_start_epoch = 30
+```
+
+新增文件：
+
+```text
+configs/rf_clath_hmdb_agentic_unified.yaml
+tools/run_rf_clath_hmdb_agentic_unified_disk2.sh
+losses/arf_loss.py: AgenticUnifiedContrastiveLoss
+```
+
+远端验证：
+
+```text
+py_compile: passed
+bash -n: passed
+criterion build: AgenticUnifiedContrastiveLoss requires_planner_memory=True
+
+smoke, HMDB16, batch_size=256, max_steps=2:
+  agentic_raw > 0
+  agentic_pos_view > 0
+  agentic_pos_batch > 0
+  agentic_pos_memory > 0
+  agentic_pos_arf > 0
+  pre-start agentic_hpos = 0
+  pre-start agentic_hneg = 0
+
+hard-mining sanity, HMDB16, batch_size=256, max_steps=2,
+temporary actual_trace_start_epoch=1 / hard_mining_start_epoch=1:
+  agentic_hpos > 0
+  agentic_hneg > 0
+```
+
+正式实验：
+
+| Dataset | Bit | Experiment | GPU | Launcher PID | Train PID | Train Dir | Launcher Log | Queue Log | Status |
+|---|---:|---|---:|---:|---:|---|---|---|---|
+| HMDB51 | 16 | Agentic Unified Contrastive v1 | cuda0 | 518022 | 518032 | `/mnt/disk2/yql/RF-CLaTH_outputs/rf_clath_agentic_unified_v1_hmdb_disk2/hmdb_16b_20260610_151305` | `/mnt/disk2/yql/RF-CLaTH_run_logs/rf_clath_agentic_unified_hmdb16_cuda0_launcher_20260610_151304.log` | `/mnt/disk2/yql/RF-CLaTH_run_logs/rf_clath_agentic_unified_v1_hmdb_disk2_20260610_151304.queue.log` | running |
+
+对比目标：
+
+```text
+Stage1 HMDB16 best mAP@100 = 0.0994
+A missed-positive best mAP@100 = 0.0993
+```

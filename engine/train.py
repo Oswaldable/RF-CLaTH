@@ -10,7 +10,14 @@ from torch.utils.data import DataLoader
 
 from datasets.video_dataset import build_dataloaders
 from engine.evaluate import evaluate_retrieval
-from losses import ARFLoss, ContrastiveARFLoss, HybridARFLoss, RFClathLoss, StaticARFLoss
+from losses import (
+    ARFLoss,
+    AgenticUnifiedContrastiveLoss,
+    ContrastiveARFLoss,
+    HybridARFLoss,
+    RFClathLoss,
+    StaticARFLoss,
+)
 from memory import PlannerMemoryBank, build_label_bank
 from models import RetrievalFeedbackContentLateralTemporalHashing
 from planner import RetrievalGraphPlanner
@@ -65,6 +72,8 @@ def build_criterion(cfg: Dict) -> nn.Module:
         return HybridARFLoss(cfg)
     if objective in {"arf_memory_contrastive", "contrastive_arf", "hybrid_contrastive_arf"}:
         return ContrastiveARFLoss(cfg)
+    if objective in {"agentic_unified_contrastive", "agentic_contrastive", "unified_agentic_contrastive"}:
+        return AgenticUnifiedContrastiveLoss(cfg)
     return RFClathLoss(cfg)
 
 
@@ -202,6 +211,9 @@ def train_one_epoch(
                 "quant=%.4f bit_bal=%.4f arf_targets=%.1f arf_target=%.3f arf_hpos=%.1f arf_hard=%.1f "
                 "arf_overlap=%.3f arf_false=%.3f arf_missed=%.3f arf_retrieved=%.3f "
                 "arf_weight=%.3f eta_m=%.3f eta_f=%.3f omega_z=%.3f arf_gamma=%.1f "
+                "agentic_raw=%.4f agentic_pos_view=%.1f agentic_pos_batch=%.1f "
+                "agentic_pos_memory=%.1f agentic_pos_arf=%.1f agentic_hpos=%.1f "
+                "agentic_hneg=%.1f agentic_pos_weight=%.3f "
                 "agree=%.3f hamm=%.3f entropy=%.3f bit_use=%.3f sat=%.3f mask=%.3f fast_cos=%.3f",
                 epoch,
                 step,
@@ -229,6 +241,14 @@ def train_one_epoch(
                 float(losses.get("metric_arf_eta_false", torch.zeros((), device=device)).detach().cpu()),
                 float(losses.get("metric_arf_omega_z", torch.zeros((), device=device)).detach().cpu()),
                 float(losses.get("metric_arf_gamma", torch.zeros((), device=device)).detach().cpu()),
+                float(losses.get("metric_agentic_raw", torch.zeros((), device=device)).detach().cpu()),
+                float(losses.get("metric_agentic_pos_view", torch.zeros((), device=device)).detach().cpu()),
+                float(losses.get("metric_agentic_pos_batch", torch.zeros((), device=device)).detach().cpu()),
+                float(losses.get("metric_agentic_pos_memory", torch.zeros((), device=device)).detach().cpu()),
+                float(losses.get("metric_agentic_pos_arf", torch.zeros((), device=device)).detach().cpu()),
+                float(losses.get("metric_agentic_hard_positive_count", torch.zeros((), device=device)).detach().cpu()),
+                float(losses.get("metric_agentic_hard_negative_count", torch.zeros((), device=device)).detach().cpu()),
+                float(losses.get("metric_agentic_positive_weight_mean", torch.zeros((), device=device)).detach().cpu()),
                 hash_metrics["metric_hash_agree"],
                 hash_metrics["metric_hamm_norm"],
                 hash_metrics["metric_bit_entropy"],
@@ -272,6 +292,9 @@ def train_one_epoch(
         "quant=%.4f bit_bal=%.4f arf_targets=%.1f arf_target=%.3f arf_hpos=%.1f arf_hard=%.1f "
         "arf_overlap=%.3f arf_false=%.3f arf_missed=%.3f arf_retrieved=%.3f "
         "arf_weight=%.3f eta_m=%.3f eta_f=%.3f omega_z=%.3f arf_gamma=%.1f "
+        "agentic_raw=%.4f agentic_pos_view=%.1f agentic_pos_batch=%.1f "
+        "agentic_pos_memory=%.1f agentic_pos_arf=%.1f agentic_hpos=%.1f "
+        "agentic_hneg=%.1f agentic_pos_weight=%.3f "
         "agree=%.3f hamm=%.3f entropy=%.3f bit_use=%.3f balance_abs=%.3f sat=%.3f std=%.3f pos=%.3f mask=%.3f fast_cos=%.3f fused_cos=%.3f",
         epoch,
         time.time() - start,
@@ -298,6 +321,14 @@ def train_one_epoch(
         averaged.get("metric_arf_eta_false", 0.0),
         averaged.get("metric_arf_omega_z", 0.0),
         averaged.get("metric_arf_gamma", 0.0),
+        averaged.get("metric_agentic_raw", 0.0),
+        averaged.get("metric_agentic_pos_view", 0.0),
+        averaged.get("metric_agentic_pos_batch", 0.0),
+        averaged.get("metric_agentic_pos_memory", 0.0),
+        averaged.get("metric_agentic_pos_arf", 0.0),
+        averaged.get("metric_agentic_hard_positive_count", 0.0),
+        averaged.get("metric_agentic_hard_negative_count", 0.0),
+        averaged.get("metric_agentic_positive_weight_mean", 0.0),
         averaged.get("metric_hash_agree", 0.0),
         averaged.get("metric_hamm_norm", 0.0),
         averaged.get("metric_bit_entropy", 0.0),
