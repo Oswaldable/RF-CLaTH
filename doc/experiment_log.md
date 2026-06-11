@@ -1528,3 +1528,73 @@ Phase II:
 cuda3 still has the old-code warm60 ramp20 process running.
 true-AUCL retain50 was placed on cuda3 because memory remained sufficient.
 ```
+
+## 2026-06-11 AUCL v2 HMDB16 Launch
+
+目的：停止 cuda2 上旧的 true-AUCL ramp20 方向，改跑重新设计后的 source-factored AUCL v2。
+
+停止记录：
+
+```text
+stopped:
+  launcher PID: 3535820
+  train PID: 3535828
+  experiment: true-AUCL warmup60 ramp20
+  queue log: /mnt/disk2/yql/RF-CLaTH_run_logs/rf_clath_trueaucl_stage1warm60_ramp20_v1_hmdb_disk2_20260611_045442.queue.log
+```
+
+新实验设置：
+
+```text
+dataset: HMDB51
+bits: 16
+gpu: cuda2
+objective: agentic_unified_contrastive_v2
+
+L_AUCL_v2:
+  0.30 L_view_pair
+  0.50 L_batch_neighbor
+  0.04 L_memory_agentic
+  + 0.02 L_quant
+  + 0.03 L_balance
+
+schedule:
+  epoch 1-60: beta=0, Stage1-equivalent memory raw positives
+  epoch 61-80: beta ramps to 0.25
+  epoch 80+: hard mining enabled
+```
+
+启动记录：
+
+| Dataset | Bit | Experiment | GPU | Launcher PID | Train PID | Train Dir | Launcher Log | Queue Log | Status |
+|---|---:|---|---:|---:|---:|---|---|---|---|
+| HMDB51 | 16 | AUCL v2 warm60 ramp20 | cuda2 | 2192714 | 2192724 | `/mnt/disk2/yql/RF-CLaTH_outputs/rf_clath_agentic_unified_v2_warm60_ramp20_hmdb16_cuda2_hmdb_disk2/hmdb_16b_20260611_104019` | `/mnt/disk2/yql/RF-CLaTH_run_logs/rf_clath_auclv2_hmdb16_cuda2_launcher_20260611_104018.log` | `/mnt/disk2/yql/RF-CLaTH_run_logs/rf_clath_agentic_unified_v2_warm60_ramp20_hmdb16_cuda2_hmdb_disk2_20260611_104018.queue.log` | completed |
+
+完成结果：
+
+| Dataset | Bit | Experiment | Best Epoch | mAP@5 | mAP@20 | mAP@40 | mAP@60 | mAP@80 | mAP@100 | P@100 | R@100 | Last Epoch | Last mAP@100 |
+|---|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| HMDB51 | 16 | AUCL v2 warm60 ramp20 | 115 | 0.3207 | 0.2408 | 0.1857 | 0.1453 | 0.1173 | 0.0983 | 0.1689 | 0.2252 | 150 | 0.0963 |
+
+对比：
+
+```text
+Stage1 HMDB16 baseline:             best mAP@100 = 0.0994
+old warmup60 hard switch:           best mAP@100 = 0.1036
+failed true-AUCL v1 ramp20:          best mAP@100 = 0.0653
+AUCL v2 warm60 ramp20:               best mAP@100 = 0.0983
+```
+
+诊断：
+
+```text
+AUCL v2 明显避免了 true-AUCL v1 的崩塌，但未超过 Stage1 baseline。
+epoch 80 后 hard mining 正常开启，late epoch 典型值：
+  aucl_beta ~= 0.250
+  aucl_pos_raw ~= 10.0
+  aucl_pos_planned ~= 5.0
+  aucl_pos_missed ~= 4.7-4.8
+  aucl_hneg ~= 9.0-9.3
+  aucl_memory_raw ~= 2.71
+  aucl_memory_feedback ~= 2.16
+```
