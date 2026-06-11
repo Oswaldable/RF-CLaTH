@@ -1371,3 +1371,160 @@ aliases:
 Current running experiments were not stopped. They keep the Python code loaded at process start.
 Future experiments launched from the updated scripts will use the true two-phase AUCL implementation.
 ```
+
+Running experiment status check:
+
+```text
+2026-06-11:
+
+Important:
+  The currently running warmup60 short/ramp/retain jobs were launched before the true two-phase AUCL code change.
+  They are old-code jobs and still use the legacy Stage1 warmup behavior inside the running Python processes.
+  Future launches from the updated scripts will use true two-phase AUCL.
+
+Still running:
+  warmup40 hard switch:
+    train epoch: 132
+    latest eval epoch: 130
+    best epoch: 80
+    best mAP@100: 0.1022
+    latest mAP@100: 0.0978
+    interpretation: peaked early and has clearly decayed; not a promising final setting.
+
+  warmup60 short110:
+    train epoch: 13
+    latest eval epoch: 10
+    best mAP@100: 0.0608
+    mix_alpha=0.0, stage1_keep=1.0
+    interpretation: still in Phase I warmup; no switch-strategy signal yet.
+
+  warmup60 ramp20:
+    train epoch: 11
+    latest eval epoch: 10
+    best mAP@100: 0.0608
+    mix_alpha=0.0, stage1_keep=1.0
+    interpretation: still in Phase I warmup; ramp starts at epoch 61.
+
+  warmup60 retain50:
+    train epoch: 9
+    latest eval epoch: 5
+    best mAP@100: 0.0458
+    mix_alpha=0.0, stage1_keep=1.0
+    interpretation: still in Phase I warmup; retain50 starts at epoch 61.
+
+Reference completed run:
+  warmup60 hard switch:
+    best epoch: 105
+    best mAP@100: 0.1036
+    latest epoch 150 mAP@100: 0.1006
+```
+
+Running / completed old-code switch-strategy results:
+
+```text
+2026-06-11:
+
+Important:
+  These jobs were launched before the true two-phase AUCL code change.
+  They are useful as old-code switch-strategy ablations, but not as final true-AUCL evidence.
+
+warmup40 hard switch:
+  status: finished epoch 150
+  best epoch: 80
+  best mAP@100: 0.1022
+  last epoch 150 mAP@100: 0.0975
+  conclusion: earlier switch peaks but decays badly.
+
+warmup60 short110:
+  status: finished epoch 110
+  best epoch: 105
+  best mAP@5:   0.3177
+  best mAP@20:  0.2486
+  best mAP@100: 0.1033
+  last epoch 110 mAP@100: 0.1012
+  schedule sanity:
+    epoch 60: mix_alpha=0.0, stage1_keep=1.0
+    epoch 61: mix_alpha=1.0, stage1_keep=0.0
+  conclusion: close to warmup60 hard switch, but slightly lower than 0.1036.
+
+warmup60 ramp20:
+  status: still running, latest train epoch 110
+  best epoch so far: 80
+  best mAP@5:   0.3276
+  best mAP@20:  0.2499
+  best mAP@100: 0.1031
+  latest epoch 110 mAP@100: 0.1003
+  schedule sanity:
+    epoch 60: mix_alpha=0.0, stage1_keep=1.0
+    epoch 61: mix_alpha=0.05, stage1_keep=0.95
+    epoch 80: mix_alpha=1.0, stage1_keep=0.0
+  conclusion: ramp improves early peak timing and mAP@5/mAP@20, but not mAP@100.
+
+warmup60 retain50:
+  status: finished epoch 150
+  best epoch: 45
+  best mAP@100: 0.0983
+  last epoch 150 mAP@100: 0.0958
+  schedule sanity:
+    epoch 61+: mix_alpha=0.5, stage1_keep=0.5
+  conclusion: retaining old Stage1 objective at 0.5 hurts mAP@100 in this old-code wrapper.
+
+Reference:
+  warmup60 hard switch:
+    best epoch: 105
+    best mAP@100: 0.1036
+    epoch 150 mAP@100: 0.1006
+
+Current best old-code setting:
+  warmup60 hard switch remains best by mAP@100.
+
+Next useful run:
+  Relaunch true two-phase AUCL warmup60 hard / ramp20 / retain50 from the updated codebase when server resources are available.
+```
+
+## 2026-06-11 True Two-Phase AUCL Launch
+
+目的：使用已更新的 true two-phase AUCL 实现，重新运行 warmup60 hard/short、ramp20、retain50 三组。区别于上一批 old-code jobs：Phase I 不再调用旧 `RFClathLoss`，而是同一个 AUCL 的 bootstrap source schedule。
+
+共同设置：
+
+```text
+dataset: HMDB51
+bits: 16
+batch_size: 256
+objective: stage1_scheduled_agentic_unified -> PhasedAgenticUnifiedContrastiveLoss
+
+Phase I, epoch 1-60:
+  L_AUCL(source={view,batch_neighbor,memory_neighbor})
+  arf_planned = 0
+  arf_missed_bonus = 0
+  hard_negative_weight = 1.0
+  actual_trace = false
+  hard_mining = false
+
+Phase II:
+  hard/short110:
+    epoch 61-110, mix_alpha=1.0
+
+  ramp20:
+    epoch 61-80, mix_alpha linearly 0.05 -> 1.0
+    epoch 81-150, mix_alpha=1.0
+
+  retain50:
+    epoch 61-150, mix_alpha=0.5, stage1_keep=0.5
+```
+
+启动记录：
+
+| Dataset | Bit | Experiment | GPU | Launcher PID | Train PID | Train Dir | Launcher Log | Queue Log | Status |
+|---|---:|---|---:|---:|---:|---|---|---|---|
+| HMDB51 | 16 | true-AUCL warmup60 hard, short window to epoch110 | cuda0 | 3534564 | 3534571 | `/mnt/disk2/yql/RF-CLaTH_outputs/rf_clath_trueaucl_stage1warm60_short110_v1_hmdb_disk2` | `/mnt/disk2/yql/RF-CLaTH_run_logs/rf_clath_trueaucl_warm60_short110_hmdb16_cuda0_launcher_20260611_045434.log` | `/mnt/disk2/yql/RF-CLaTH_run_logs/rf_clath_trueaucl_stage1warm60_short110_v1_hmdb_disk2_20260611_045434.queue.log` | running |
+| HMDB51 | 16 | true-AUCL warmup60 ramp20 | cuda2 | 3535820 | 3535828 | `/mnt/disk2/yql/RF-CLaTH_outputs/rf_clath_trueaucl_stage1warm60_ramp20_v1_hmdb_disk2` | `/mnt/disk2/yql/RF-CLaTH_run_logs/rf_clath_trueaucl_warm60_ramp20_hmdb16_cuda2_launcher_20260611_045442.log` | `/mnt/disk2/yql/RF-CLaTH_run_logs/rf_clath_trueaucl_stage1warm60_ramp20_v1_hmdb_disk2_20260611_045442.queue.log` | running |
+| HMDB51 | 16 | true-AUCL warmup60 retain50 | cuda3 | 3537313 | 3537322 | `/mnt/disk2/yql/RF-CLaTH_outputs/rf_clath_trueaucl_stage1warm60_retain50_v1_hmdb_disk2` | `/mnt/disk2/yql/RF-CLaTH_run_logs/rf_clath_trueaucl_warm60_retain50_hmdb16_cuda3_launcher_20260611_045450.log` | `/mnt/disk2/yql/RF-CLaTH_run_logs/rf_clath_trueaucl_stage1warm60_retain50_v1_hmdb_disk2_20260611_045450.queue.log` | running |
+
+备注：
+
+```text
+cuda3 still has the old-code warm60 ramp20 process running.
+true-AUCL retain50 was placed on cuda3 because memory remained sufficient.
+```
