@@ -7,7 +7,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from .contrastive import HashContrastiveLoss, NeighborHashContrastiveLoss
+from .contrastive import AgenticMemoryNeighborContrastiveLoss, HashContrastiveLoss, NeighborHashContrastiveLoss
 from .hash_losses import BalanceLoss, QuantizationLoss
 
 
@@ -704,6 +704,220 @@ class ContrastiveARFLoss(HybridARFLoss):
             "metric_arf_missed_ratio": avg_target_metric("metric_missed_ratio"),
             "metric_arf_retrieved_target_mean": avg_target_metric("metric_retrieved_target_mean"),
             "metric_arf_feedback_weight_mean": avg_target_metric("metric_feedback_weight_mean"),
+            "metric_arf_eta_missed": torch.tensor(float(schedule["eta_missed"]), device=device),
+            "metric_arf_eta_false": torch.tensor(float(schedule["eta_false"]), device=device),
+            "metric_arf_omega_z": torch.tensor(float(schedule["omega_z"]), device=device),
+            "metric_arf_gamma": torch.tensor(float(schedule["gamma"]), device=device),
+            "metric_arf_lambda_quant": torch.tensor(float(schedule["lambda_quant"]), device=device),
+        }
+
+
+class AgenticUnifiedContrastiveLossV2(ContrastiveARFLoss):
+    """Source-factored AUCL.
+
+    The public objective is one AUCL term, but view, batch-neighbor, and
+    memory-agentic supervision keep the separate candidate spaces that made
+    Stage1 stable.
+    """
+
+    requires_planner_memory = True
+
+    def __init__(self, cfg: Dict):
+        super().__init__(cfg)
+        loss_cfg = cfg.get("loss", {})
+        model_cfg = cfg.get("model", {})
+        memory_cfg = loss_cfg.get("memory_neighbor", {})
+        aucl_cfg = cfg.get(
+            "agentic_contrastive_v2",
+            loss_cfg.get("agentic_contrastive_v2", cfg.get("agentic_contrastive", {})),
+        )
+        temperature = float(loss_cfg.get("neighbor_temperature", loss_cfg.get("temperature", 0.2)))
+
+        self.lambda_view = _get_float(
+            loss_cfg,
+            (("view", "lambda"), ("consistency", "lambda"), ("lambda_consistency",), ("lambda_hash_con",)),
+            0.30,
+        )
+        self.lambda_batch_neighbor = _get_float(
+            loss_cfg,
+            (("semantic", "lambda_batch_neighbor"), ("lambda_neighbor_con",)),
+            0.50,
+        )
+        self.lambda_memory_agentic = _get_float(
+            loss_cfg,
+            (("semantic", "lambda_memory_neighbor"), ("lambda_memory_neighbor",)),
+            0.04,
+        )
+
+        self.stage1_warmup_epochs = int(aucl_cfg.get("stage1_warmup_epochs", 60))
+        self.agentic_ramp_epochs = max(1, int(aucl_cfg.get("agentic_ramp_epochs", aucl_cfg.get("ramp_epochs", 20))))
+        self.max_agentic_memory_mix = min(1.0, max(0.0, float(aucl_cfg.get("max_agentic_memory_mix", 0.25))))
+        self.actual_trace_start_epoch = int(aucl_cfg.get("actual_trace_start_epoch", self.stage1_warmup_epochs + 1))
+        self.hard_mining_start_epoch = int(aucl_cfg.get("hard_mining_start_epoch", self.stage1_warmup_epochs + self.agentic_ramp_epochs))
+        self.memory_agentic_start_epoch = int(memory_cfg.get("start_epoch", 2))
+
+        self.agentic_memory_contrast = AgenticMemoryNeighborContrastiveLoss(
+            num_items=int(memory_cfg.get("num_items", 0)),
+            hash_bits=int(model_cfg.get("hash_bits", 64)),
+            temperature=float(memory_cfg.get("temperature", temperature)),
+            momentum=float(memory_cfg.get("momentum", 0.9)),
+            positives_per_anchor=int(memory_cfg.get("positives_per_anchor", 10)),
+            include_self=bool(memory_cfg.get("include_self", False)),
+            planned_topk=int(aucl_cfg.get("planned_positive_topk", aucl_cfg.get("arf_positive_topk", 5))),
+            missed_topk=int(aucl_cfg.get("missed_positive_topk", 5)),
+            raw_positive_weight=float(aucl_cfg.get("raw_positive_weight", 1.0)),
+            planned_positive_weight=float(aucl_cfg.get("planned_positive_weight", 0.5)),
+            missed_positive_weight=float(aucl_cfg.get("missed_positive_weight", 1.25)),
+            hard_negative_weight=float(aucl_cfg.get("hard_negative_weight", 1.10)),
+            max_positive_weight=float(aucl_cfg.get("max_positive_weight", 2.0)),
+            normalize_sources=bool(aucl_cfg.get("normalize_sources", False)),
+        )
+
+    def _aucl_beta(self, epoch: int) -> float:
+        if epoch <= self.stage1_warmup_epochs:
+            return 0.0
+        progress = min(1.0, max(0.0, float(epoch - self.stage1_warmup_epochs) / float(self.agentic_ramp_epochs)))
+        return self.max_agentic_memory_mix * progress
+
+    def _trace_targets_for_view(
+        self,
+        outputs: Dict[str, torch.Tensor],
+        view_key: str,
+        memory,
+        planner,
+        sample_indices: torch.Tensor,
+        schedule: Dict[str, float | bool],
+    ) -> Dict[str, torch.Tensor]:
+        return planner.arf_trace_targets(
+            memory,
+            sample_indices,
+            outputs[view_key],
+            top_r=self.top_r,
+            random_anchors=self.random_anchors,
+            use_actual_trace=bool(schedule["use_actual_trace"]),
+            omega_s=float(schedule["omega_s"]),
+            omega_t=float(schedule["omega_t"]),
+            omega_z=float(schedule["omega_z"]),
+            eta_missed=float(schedule["eta_missed"]),
+            eta_false=float(schedule["eta_false"]),
+            weight_clip=self.weight_clip,
+        )
+
+    def forward(self, outputs: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+        device = outputs["u_a"].device
+        zero = torch.zeros((), device=device)
+        memory = outputs.get("planner_memory", None)
+        planner = outputs.get("graph_planner", None)
+        sample_indices = outputs.get("sample_indices", None)
+        neighbor_indices = outputs.get("neighbor_indices", None)
+        if memory is None or planner is None or sample_indices is None or neighbor_indices is None:
+            raise ValueError(
+                "AgenticUnifiedContrastiveLossV2 requires planner_memory, graph_planner, sample_indices, and neighbor_indices."
+            )
+
+        epoch_tensor = outputs.get("epoch", torch.ones((), device=device))
+        epoch = int(epoch_tensor.detach().cpu().item()) if torch.is_tensor(epoch_tensor) else int(epoch_tensor)
+        beta = self._aucl_beta(epoch)
+
+        schedule = dict(self._schedule(epoch))
+        if epoch < self.actual_trace_start_epoch:
+            schedule["use_actual_trace"] = False
+            schedule["eta_missed"] = 0.0
+            schedule["eta_false"] = 0.0
+        else:
+            schedule["use_actual_trace"] = True
+        hard_mining_enabled = epoch >= self.hard_mining_start_epoch and bool(schedule["use_actual_trace"])
+
+        targets_a = self._trace_targets_for_view(outputs, "u_a", memory, planner, sample_indices, schedule)
+        targets_b = self._trace_targets_for_view(outputs, "u_b", memory, planner, sample_indices, schedule)
+
+        component_view = zero
+        if self.lambda_view > 0:
+            component_view = self.hash_contrast(outputs["u_a"], outputs["u_b"])
+
+        component_batch_neighbor = zero
+        if self.lambda_batch_neighbor > 0:
+            component_batch_neighbor = self.neighbor_hash_contrast(
+                outputs["u_a"],
+                outputs["u_b"],
+                sample_indices,
+                neighbor_indices,
+            )
+
+        if self.lambda_memory_agentic > 0 and epoch >= self.memory_agentic_start_epoch:
+            memory_metrics = self.agentic_memory_contrast.forward_agentic(
+                outputs["u_a"],
+                outputs["u_b"],
+                sample_indices,
+                neighbor_indices,
+                targets_a,
+                targets_b,
+                beta=beta,
+                hard_mining_enabled=hard_mining_enabled,
+            )
+        else:
+            memory_metrics = self.agentic_memory_contrast._zero_result(outputs["u_a"])
+        component_memory_agentic = memory_metrics["memory_agentic"]
+
+        component_quant = self.quantization(outputs["u_a"], outputs["u_b"])
+        component_bit_balance = self.balance(outputs["u_a"], outputs["u_b"])
+
+        loss_view = self.lambda_view * component_view
+        loss_batch = self.lambda_batch_neighbor * component_batch_neighbor
+        loss_memory = self.lambda_memory_agentic * component_memory_agentic
+        loss_aucl = loss_view + loss_batch + loss_memory
+        loss_hash = (
+            float(schedule["lambda_quant"]) * component_quant
+            + float(schedule["lambda_balance"]) * component_bit_balance
+        )
+        total = loss_aucl + loss_hash
+
+        def avg_target_metric(key: str) -> torch.Tensor:
+            a = targets_a[key].to(device) if torch.is_tensor(targets_a[key]) else torch.tensor(targets_a[key], device=device)
+            b = targets_b[key].to(device) if torch.is_tensor(targets_b[key]) else torch.tensor(targets_b[key], device=device)
+            return 0.5 * (a.float() + b.float())
+
+        return {
+            "component_view_contrast": component_view,
+            "component_batch_neighbor": component_batch_neighbor,
+            "component_memory_neighbor": component_memory_agentic,
+            "component_arf_static": zero,
+            "component_arf_contrastive": zero,
+            "component_agentic_contrastive": loss_aucl,
+            "component_quant": component_quant,
+            "component_bit_balance": component_bit_balance,
+            "loss_view": loss_view,
+            "loss_semantic": loss_aucl,
+            "loss_arf": zero,
+            "loss_hash": loss_hash,
+            "loss": total,
+            "metric_agentic_raw": loss_aucl.detach(),
+            "metric_agentic_pos_view": torch.ones((), device=device),
+            "metric_agentic_pos_batch": memory_metrics["pos_raw_count"] * 0.0,
+            "metric_agentic_pos_memory": memory_metrics["pos_raw_count"],
+            "metric_agentic_pos_arf": memory_metrics["pos_planned_count"],
+            "metric_agentic_hard_positive_count": memory_metrics["pos_missed_count"],
+            "metric_agentic_hard_negative_count": memory_metrics["hard_negative_count"],
+            "metric_agentic_positive_weight_mean": memory_metrics["positive_weight_mean"],
+            "metric_agentic_mix_alpha": torch.tensor(float(beta), device=device),
+            "metric_stage1_keep_weight": torch.tensor(float(1.0 - beta), device=device),
+            "metric_aucl_raw": loss_aucl.detach(),
+            "metric_aucl_memory_raw": memory_metrics["memory_raw"].detach(),
+            "metric_aucl_memory_feedback": memory_metrics["memory_feedback"].detach(),
+            "metric_aucl_beta": torch.tensor(float(beta), device=device),
+            "metric_aucl_pos_raw": memory_metrics["pos_raw_count"],
+            "metric_aucl_pos_planned": memory_metrics["pos_planned_count"],
+            "metric_aucl_pos_missed": memory_metrics["pos_missed_count"],
+            "metric_aucl_hard_negative": memory_metrics["hard_negative_count"],
+            "metric_arf_target_count": memory_metrics["pos_planned_count"],
+            "metric_arf_target_mean": avg_target_metric("metric_retrieved_target_mean"),
+            "metric_arf_hard_positive_count": memory_metrics["pos_missed_count"],
+            "metric_arf_hard_negative_count": memory_metrics["hard_negative_count"],
+            "metric_arf_actual_overlap": avg_target_metric("metric_actual_overlap"),
+            "metric_arf_false_ratio": avg_target_metric("metric_false_ratio"),
+            "metric_arf_missed_ratio": avg_target_metric("metric_missed_ratio"),
+            "metric_arf_retrieved_target_mean": avg_target_metric("metric_retrieved_target_mean"),
+            "metric_arf_feedback_weight_mean": memory_metrics["positive_weight_mean"],
             "metric_arf_eta_missed": torch.tensor(float(schedule["eta_missed"]), device=device),
             "metric_arf_eta_false": torch.tensor(float(schedule["eta_false"]), device=device),
             "metric_arf_omega_z": torch.tensor(float(schedule["omega_z"]), device=device),

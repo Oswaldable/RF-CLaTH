@@ -1,3 +1,5 @@
+import math
+
 import torch
 from torch import nn
 import torch.nn.functional as F
@@ -235,3 +237,234 @@ class MemoryNeighborContrastiveLoss(nn.Module):
         loss = loss[valid_rows].mean()
         self._update_memory(sample_indices, current_value)
         return loss.to(dtype=u_a.dtype)
+
+
+class AgenticMemoryNeighborContrastiveLoss(MemoryNeighborContrastiveLoss):
+    """Memory-neighbor InfoNCE with planner feedback inside the memory channel.
+
+    This keeps the Stage1 memory-bank behavior and update timing intact while
+    exposing a feedback variant that adds planner positives, missed positives,
+    and actual-not-planned hard negatives.
+    """
+
+    def __init__(
+        self,
+        num_items: int,
+        hash_bits: int,
+        temperature: float = 0.2,
+        momentum: float = 0.9,
+        positives_per_anchor: int = 10,
+        include_self: bool = False,
+        planned_topk: int = 5,
+        missed_topk: int = 5,
+        raw_positive_weight: float = 1.0,
+        planned_positive_weight: float = 0.5,
+        missed_positive_weight: float = 1.25,
+        hard_negative_weight: float = 1.10,
+        max_positive_weight: float = 2.0,
+        normalize_sources: bool = False,
+    ):
+        super().__init__(
+            num_items=num_items,
+            hash_bits=hash_bits,
+            temperature=temperature,
+            momentum=momentum,
+            positives_per_anchor=positives_per_anchor,
+            include_self=include_self,
+        )
+        self.planned_topk = max(0, int(planned_topk))
+        self.missed_topk = max(0, int(missed_topk))
+        self.raw_positive_weight = float(raw_positive_weight)
+        self.planned_positive_weight = float(planned_positive_weight)
+        self.missed_positive_weight = float(missed_positive_weight)
+        self.hard_negative_weight = max(1.0, float(hard_negative_weight))
+        self.max_positive_weight = float(max_positive_weight)
+        self.normalize_sources = bool(normalize_sources)
+
+    def _zero_result(self, u_a: torch.Tensor):
+        zero = u_a.new_zeros(())
+        return {
+            "memory_raw": zero,
+            "memory_feedback": zero,
+            "memory_agentic": zero,
+            "pos_raw_count": zero,
+            "pos_planned_count": zero,
+            "pos_missed_count": zero,
+            "hard_negative_count": zero,
+            "positive_weight_mean": zero,
+        }
+
+    def _source_weight(self, mask: torch.Tensor, weight: float) -> torch.Tensor:
+        if weight <= 0 or mask.numel() == 0:
+            return mask.float() * 0.0
+        mask_f = mask.float()
+        if self.normalize_sources:
+            denom = mask_f.sum(dim=1, keepdim=True).clamp_min(1.0)
+            return mask_f * (float(weight) / denom)
+        return mask_f * float(weight)
+
+    def _rows_to_columns(
+        self,
+        row_indices: torch.Tensor,
+        row_mask: torch.Tensor,
+        valid_indices: torch.Tensor,
+    ) -> torch.Tensor:
+        if row_indices.numel() == 0 or valid_indices.numel() == 0:
+            return torch.zeros(
+                row_indices.shape[0],
+                valid_indices.shape[0],
+                dtype=torch.bool,
+                device=valid_indices.device,
+            )
+        row_indices = row_indices.to(device=valid_indices.device, dtype=torch.long)
+        row_mask = row_mask.to(device=valid_indices.device, dtype=torch.bool)
+        masked = row_indices.masked_fill(~row_mask, -1)
+        return (masked.unsqueeze(-1) == valid_indices.view(1, 1, -1)).any(dim=1)
+
+    def _feedback_masks_for_targets(
+        self,
+        targets,
+        valid_indices: torch.Tensor,
+        hard_mining_enabled: bool,
+    ):
+        planned_indices = targets["planned_indices"].to(device=valid_indices.device, dtype=torch.long)
+        actual_indices = targets["actual_indices"].to(device=valid_indices.device, dtype=torch.long)
+        target_mask = targets["target_mask"].to(device=valid_indices.device, dtype=torch.bool)
+
+        batch_size = planned_indices.shape[0]
+        if planned_indices.numel() == 0:
+            empty = torch.zeros(batch_size, valid_indices.shape[0], dtype=torch.bool, device=valid_indices.device)
+            return empty, empty, empty
+
+        planned_cols = planned_indices.shape[1]
+        planned_mask = target_mask[:, :planned_cols] if target_mask.shape[1] >= planned_cols else torch.ones_like(planned_indices, dtype=torch.bool)
+
+        if self.planned_topk > 0:
+            planned_positive_mask = planned_mask.clone()
+            planned_positive_mask[:, self.planned_topk :] = False
+        else:
+            planned_positive_mask = torch.zeros_like(planned_mask)
+
+        if actual_indices.numel() > 0:
+            actual_cols = actual_indices.shape[1]
+            actual_start = planned_cols
+            actual_end = actual_start + actual_cols
+            if target_mask.shape[1] >= actual_end:
+                actual_mask = target_mask[:, actual_start:actual_end]
+            else:
+                actual_mask = torch.ones_like(actual_indices, dtype=torch.bool)
+            actual_valid_indices = actual_indices.masked_fill(~actual_mask, -1)
+            in_actual = (planned_indices.unsqueeze(-1) == actual_valid_indices.unsqueeze(1)).any(dim=-1)
+            planned_valid_indices = planned_indices.masked_fill(~planned_mask, -1)
+            in_planned = (actual_indices.unsqueeze(-1) == planned_valid_indices.unsqueeze(1)).any(dim=-1)
+        else:
+            actual_mask = torch.zeros_like(actual_indices, dtype=torch.bool)
+            in_actual = torch.zeros_like(planned_mask)
+            in_planned = torch.zeros_like(actual_mask)
+
+        if hard_mining_enabled and self.missed_topk > 0:
+            missed_mask = planned_mask & (~in_actual)
+            missed_rank = missed_mask.long().cumsum(dim=1)
+            missed_mask = missed_mask & (missed_rank <= self.missed_topk)
+        else:
+            missed_mask = torch.zeros_like(planned_mask)
+
+        if hard_mining_enabled and actual_indices.numel() > 0:
+            false_mask = actual_mask & (~in_planned)
+        else:
+            false_mask = torch.zeros_like(actual_mask)
+
+        planned_cols_mask = self._rows_to_columns(planned_indices, planned_positive_mask, valid_indices)
+        missed_cols_mask = self._rows_to_columns(planned_indices, missed_mask, valid_indices)
+        false_cols_mask = self._rows_to_columns(actual_indices, false_mask, valid_indices)
+        return planned_cols_mask, missed_cols_mask, false_cols_mask
+
+    def forward_agentic(
+        self,
+        u_a: torch.Tensor,
+        u_b: torch.Tensor,
+        sample_indices: torch.Tensor,
+        neighbor_indices: torch.Tensor,
+        targets_a,
+        targets_b,
+        beta: float,
+        hard_mining_enabled: bool,
+    ):
+        if self.num_items <= 0 or u_a.shape[0] < 2:
+            return self._zero_result(u_a)
+
+        sample_indices = sample_indices.to(device=u_a.device, dtype=torch.long)
+        neighbor_indices = neighbor_indices.to(device=u_a.device, dtype=torch.long)
+        valid_indices = torch.nonzero(self.valid, as_tuple=False).flatten().to(u_a.device)
+        valid_indices = valid_indices[(valid_indices >= 0) & (valid_indices < self.num_items)]
+        current_value = 0.5 * (u_a.detach() + u_b.detach())
+
+        if valid_indices.numel() == 0:
+            self._update_memory(sample_indices, current_value)
+            return self._zero_result(u_a)
+
+        memory = F.normalize(self.memory.index_select(0, valid_indices).to(device=u_a.device, dtype=torch.float32), dim=-1)
+        queries = F.normalize(torch.cat([u_a, u_b], dim=0).float(), dim=-1)
+        logits = queries @ memory.t()
+        logits = logits / max(self.temperature, 1e-6)
+
+        raw_pos = self._positive_mask(sample_indices, neighbor_indices, valid_indices)
+        valid_rows_raw = raw_pos.any(dim=1)
+        mask_value = -1e4 if logits.dtype in {torch.float16, torch.bfloat16} else -1e9
+
+        if bool(valid_rows_raw.any().item()):
+            raw_pos_logits = logits.masked_fill(~raw_pos, mask_value)
+            raw_loss = torch.logsumexp(logits, dim=1) - torch.logsumexp(raw_pos_logits, dim=1)
+            raw_loss = raw_loss[valid_rows_raw].mean().to(dtype=u_a.dtype)
+        else:
+            raw_loss = u_a.new_zeros(())
+
+        planned_a, missed_a, false_a = self._feedback_masks_for_targets(
+            targets_a,
+            valid_indices,
+            hard_mining_enabled=hard_mining_enabled,
+        )
+        planned_b, missed_b, false_b = self._feedback_masks_for_targets(
+            targets_b,
+            valid_indices,
+            hard_mining_enabled=hard_mining_enabled,
+        )
+        planned_pos = torch.cat([planned_a, planned_b], dim=0)
+        missed_pos = torch.cat([missed_a, missed_b], dim=0)
+        hard_neg = torch.cat([false_a, false_b], dim=0)
+
+        positive_weights = torch.zeros_like(logits, dtype=torch.float32)
+        positive_weights += self._source_weight(raw_pos, self.raw_positive_weight)
+        positive_weights += self._source_weight(planned_pos, self.planned_positive_weight)
+        positive_weights += self._source_weight(missed_pos, self.missed_positive_weight)
+        positive_weights = torch.clamp(positive_weights, min=0.0, max=self.max_positive_weight)
+
+        valid_rows_feedback = (positive_weights > 0).any(dim=1)
+        if bool(valid_rows_feedback.any().item()):
+            denom_logits = logits
+            if self.hard_negative_weight > 1.0:
+                denom_logits = denom_logits + hard_neg.float() * math.log(self.hard_negative_weight)
+            feedback_pos_logits = logits + torch.log(positive_weights.clamp_min(1e-12))
+            feedback_pos_logits = feedback_pos_logits.masked_fill(positive_weights <= 0, mask_value)
+            feedback_loss = torch.logsumexp(denom_logits, dim=1) - torch.logsumexp(feedback_pos_logits, dim=1)
+            feedback_loss = feedback_loss[valid_rows_feedback].mean().to(dtype=u_a.dtype)
+        else:
+            feedback_loss = u_a.new_zeros(())
+
+        use_beta = min(1.0, max(0.0, float(beta)))
+        memory_agentic = (1.0 - use_beta) * raw_loss + use_beta * feedback_loss
+        pos_active = positive_weights > 0
+        positive_weight_mean = positive_weights[pos_active].mean() if pos_active.any() else u_a.new_zeros(())
+
+        result = {
+            "memory_raw": raw_loss,
+            "memory_feedback": feedback_loss,
+            "memory_agentic": memory_agentic.to(dtype=u_a.dtype),
+            "pos_raw_count": raw_pos.float().sum(dim=1).mean(),
+            "pos_planned_count": planned_pos.float().sum(dim=1).mean(),
+            "pos_missed_count": missed_pos.float().sum(dim=1).mean(),
+            "hard_negative_count": hard_neg.float().sum(dim=1).mean(),
+            "positive_weight_mean": positive_weight_mean,
+        }
+        self._update_memory(sample_indices, current_value)
+        return result

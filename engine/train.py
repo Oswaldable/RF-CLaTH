@@ -13,6 +13,7 @@ from engine.evaluate import evaluate_retrieval
 from losses import (
     ARFLoss,
     AgenticUnifiedContrastiveLoss,
+    AgenticUnifiedContrastiveLossV2,
     ContrastiveARFLoss,
     HybridARFLoss,
     PhasedAgenticUnifiedContrastiveLoss,
@@ -77,6 +78,8 @@ def build_criterion(cfg: Dict) -> nn.Module:
         return ContrastiveARFLoss(cfg)
     if objective in {"agentic_unified_contrastive", "agentic_contrastive", "unified_agentic_contrastive"}:
         return AgenticUnifiedContrastiveLoss(cfg)
+    if objective in {"agentic_unified_contrastive_v2", "agentic_contrastive_v2", "aucl_v2"}:
+        return AgenticUnifiedContrastiveLossV2(cfg)
     if objective in {"stage1_warmup_agentic_unified", "stage1_then_agentic_unified"}:
         return Stage1WarmupAgenticUnifiedLoss(cfg)
     if objective in {"phased_agentic_unified", "phased_agentic_unified_contrastive"}:
@@ -228,6 +231,8 @@ def train_one_epoch(
                 "agentic_raw=%.4f agentic_pos_view=%.1f agentic_pos_batch=%.1f "
                 "agentic_pos_memory=%.1f agentic_pos_arf=%.1f agentic_hpos=%.1f "
                 "agentic_hneg=%.1f agentic_pos_weight=%.3f mix_alpha=%.3f stage1_keep=%.3f "
+                "aucl_raw=%.4f aucl_mem_raw=%.4f aucl_mem_fb=%.4f aucl_beta=%.3f "
+                "aucl_pos_raw=%.1f aucl_pos_planned=%.1f aucl_pos_missed=%.1f aucl_hneg=%.1f "
                 "agree=%.3f hamm=%.3f entropy=%.3f bit_use=%.3f sat=%.3f mask=%.3f fast_cos=%.3f",
                 epoch,
                 step,
@@ -265,6 +270,14 @@ def train_one_epoch(
                 float(losses.get("metric_agentic_positive_weight_mean", torch.zeros((), device=device)).detach().cpu()),
                 float(losses.get("metric_agentic_mix_alpha", torch.zeros((), device=device)).detach().cpu()),
                 float(losses.get("metric_stage1_keep_weight", torch.zeros((), device=device)).detach().cpu()),
+                float(losses.get("metric_aucl_raw", torch.zeros((), device=device)).detach().cpu()),
+                float(losses.get("metric_aucl_memory_raw", torch.zeros((), device=device)).detach().cpu()),
+                float(losses.get("metric_aucl_memory_feedback", torch.zeros((), device=device)).detach().cpu()),
+                float(losses.get("metric_aucl_beta", torch.zeros((), device=device)).detach().cpu()),
+                float(losses.get("metric_aucl_pos_raw", torch.zeros((), device=device)).detach().cpu()),
+                float(losses.get("metric_aucl_pos_planned", torch.zeros((), device=device)).detach().cpu()),
+                float(losses.get("metric_aucl_pos_missed", torch.zeros((), device=device)).detach().cpu()),
+                float(losses.get("metric_aucl_hard_negative", torch.zeros((), device=device)).detach().cpu()),
                 hash_metrics["metric_hash_agree"],
                 hash_metrics["metric_hamm_norm"],
                 hash_metrics["metric_bit_entropy"],
@@ -311,6 +324,8 @@ def train_one_epoch(
         "agentic_raw=%.4f agentic_pos_view=%.1f agentic_pos_batch=%.1f "
         "agentic_pos_memory=%.1f agentic_pos_arf=%.1f agentic_hpos=%.1f "
         "agentic_hneg=%.1f agentic_pos_weight=%.3f mix_alpha=%.3f stage1_keep=%.3f "
+        "aucl_raw=%.4f aucl_mem_raw=%.4f aucl_mem_fb=%.4f aucl_beta=%.3f "
+        "aucl_pos_raw=%.1f aucl_pos_planned=%.1f aucl_pos_missed=%.1f aucl_hneg=%.1f "
         "agree=%.3f hamm=%.3f entropy=%.3f bit_use=%.3f balance_abs=%.3f sat=%.3f std=%.3f pos=%.3f mask=%.3f fast_cos=%.3f fused_cos=%.3f",
         epoch,
         time.time() - start,
@@ -347,6 +362,14 @@ def train_one_epoch(
         averaged.get("metric_agentic_positive_weight_mean", 0.0),
         averaged.get("metric_agentic_mix_alpha", 0.0),
         averaged.get("metric_stage1_keep_weight", 0.0),
+        averaged.get("metric_aucl_raw", 0.0),
+        averaged.get("metric_aucl_memory_raw", 0.0),
+        averaged.get("metric_aucl_memory_feedback", 0.0),
+        averaged.get("metric_aucl_beta", 0.0),
+        averaged.get("metric_aucl_pos_raw", 0.0),
+        averaged.get("metric_aucl_pos_planned", 0.0),
+        averaged.get("metric_aucl_pos_missed", 0.0),
+        averaged.get("metric_aucl_hard_negative", 0.0),
         averaged.get("metric_hash_agree", 0.0),
         averaged.get("metric_hamm_norm", 0.0),
         averaged.get("metric_bit_entropy", 0.0),

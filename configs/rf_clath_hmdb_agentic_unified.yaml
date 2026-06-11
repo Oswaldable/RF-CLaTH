@@ -106,6 +106,9 @@ loss:
   temperature: 0.2
   neighbor_temperature: 0.2
   symmetric_neighbors: true
+  semantic:
+    lambda_batch_neighbor: 0.5
+    lambda_memory_neighbor: 0.04
   hash:
     lambda_quant: 0.02
     lambda_bit_balance: 0.03
@@ -131,6 +134,21 @@ agentic_contrastive:
     arf_planned: 0.25
     arf_missed_bonus: 0.25
   hard_negative_weight: 1.25
+
+agentic_contrastive_v2:
+  stage1_warmup_epochs: 60
+  agentic_ramp_epochs: 20
+  max_agentic_memory_mix: 0.25
+  actual_trace_start_epoch: 61
+  hard_mining_start_epoch: 80
+  planned_positive_topk: 5
+  missed_positive_topk: 5
+  raw_positive_weight: 1.0
+  planned_positive_weight: 0.5
+  missed_positive_weight: 1.25
+  hard_negative_weight: 1.10
+  max_positive_weight: 2.0
+  normalize_sources: false
 
 arf_loss:
   gamma: 8
