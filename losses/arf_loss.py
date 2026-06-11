@@ -9,7 +9,6 @@ from torch import nn
 
 from .contrastive import HashContrastiveLoss, NeighborHashContrastiveLoss
 from .hash_losses import BalanceLoss, QuantizationLoss
-from .total_loss import RFClathLoss
 
 
 def _get_nested(cfg: Dict, path: Tuple[str, ...], default=None):
@@ -861,6 +860,7 @@ class AgenticUnifiedContrastiveLoss(ContrastiveARFLoss):
         neighbor_indices: torch.Tensor,
         schedule: Dict[str, float | bool],
         hard_mining_enabled: bool,
+        source_weights: Dict[str, float] | None = None,
     ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
         device = outputs["u_a"].device
         batch_size = outputs["u_a"].shape[0]
@@ -926,13 +926,23 @@ class AgenticUnifiedContrastiveLoss(ContrastiveARFLoss):
         hard_positive_mask = torch.cat([hpos_a, hpos_b], dim=0) & memory_candidate_mask
         hard_negative_mask = torch.cat([hneg_a, hneg_b], dim=0) & memory_candidate_mask
 
+        source_weights = source_weights or {}
+        source_weight_view = float(source_weights.get("view", self.source_weight_view))
+        source_weight_batch = float(source_weights.get("batch_neighbor", self.source_weight_batch))
+        source_weight_memory = float(source_weights.get("memory_neighbor", self.source_weight_memory))
+        source_weight_arf = float(source_weights.get("arf_planned", self.source_weight_arf))
+        source_weight_missed_bonus = float(
+            source_weights.get("arf_missed_bonus", self.source_weight_missed_bonus)
+        )
+        hard_negative_weight = max(1.0, float(source_weights.get("hard_negative_weight", self.hard_negative_weight)))
+
         positive_weights = torch.zeros_like(logits, dtype=torch.float32)
-        positive_weights[:, :query_count] += self._source_addition(view_mask, self.source_weight_view)
-        positive_weights[:, :query_count] += self._source_addition(batch_neighbor_mask, self.source_weight_batch)
+        positive_weights[:, :query_count] += self._source_addition(view_mask, source_weight_view)
+        positive_weights[:, :query_count] += self._source_addition(batch_neighbor_mask, source_weight_batch)
         if valid_indices.numel() > 0:
-            positive_weights[:, query_count:] += self._source_addition(memory_neighbor_mask, self.source_weight_memory)
-            positive_weights[:, query_count:] += self._source_addition(arf_mask, self.source_weight_arf)
-            positive_weights[:, query_count:] += self._source_addition(hard_positive_mask, self.source_weight_missed_bonus)
+            positive_weights[:, query_count:] += self._source_addition(memory_neighbor_mask, source_weight_memory)
+            positive_weights[:, query_count:] += self._source_addition(arf_mask, source_weight_arf)
+            positive_weights[:, query_count:] += self._source_addition(hard_positive_mask, source_weight_missed_bonus)
         positive_weights = torch.clamp(positive_weights, min=0.0, max=self.max_positive_weight)
         positive_weights = positive_weights * candidate_mask.float()
 
@@ -954,9 +964,9 @@ class AgenticUnifiedContrastiveLoss(ContrastiveARFLoss):
 
         mask_value = -1e4 if logits.dtype in {torch.float16, torch.bfloat16} else -1e9
         denom_logits = logits.masked_fill(~candidate_mask, mask_value)
-        if self.hard_negative_weight > 1.0 and valid_indices.numel() > 0:
+        if hard_negative_weight > 1.0 and valid_indices.numel() > 0:
             denom_bonus = torch.zeros_like(logits)
-            denom_bonus[:, query_count:] = hard_negative_mask.float() * math.log(self.hard_negative_weight)
+            denom_bonus[:, query_count:] = hard_negative_mask.float() * math.log(hard_negative_weight)
             denom_logits = denom_logits + denom_bonus
         positive_logits = logits + torch.log(positive_weights.clamp_min(1e-12))
         positive_logits = positive_logits.masked_fill(positive_weights <= 0, mask_value)
@@ -970,13 +980,17 @@ class AgenticUnifiedContrastiveLoss(ContrastiveARFLoss):
             "metrics_b": metrics_b,
             "view_count": view_mask.float().sum(dim=1).mean(),
             "batch_count": batch_neighbor_mask.float().sum(dim=1).mean(),
-            "memory_count": memory_neighbor_mask.float().sum(dim=1).mean() if valid_indices.numel() > 0 else query.new_zeros(()),
-            "arf_count": arf_mask.float().sum(dim=1).mean() if valid_indices.numel() > 0 else query.new_zeros(()),
+            "memory_count": memory_neighbor_mask.float().sum(dim=1).mean()
+            if valid_indices.numel() > 0 and source_weight_memory > 0
+            else query.new_zeros(()),
+            "arf_count": arf_mask.float().sum(dim=1).mean()
+            if valid_indices.numel() > 0 and source_weight_arf > 0
+            else query.new_zeros(()),
             "hard_positive_count": hard_positive_mask.float().sum(dim=1).mean()
-            if valid_indices.numel() > 0
+            if valid_indices.numel() > 0 and source_weight_missed_bonus > 0
             else query.new_zeros(()),
             "hard_negative_count": hard_negative_mask.float().sum(dim=1).mean()
-            if valid_indices.numel() > 0
+            if valid_indices.numel() > 0 and hard_negative_weight > 1.0
             else query.new_zeros(()),
             "positive_weight": positive_weights[pos_active].mean() if pos_active.any() else query.new_zeros(()),
         }
@@ -1072,13 +1086,13 @@ class AgenticUnifiedContrastiveLoss(ContrastiveARFLoss):
         }
 
 
-class Stage1ScheduledAgenticUnifiedLoss(nn.Module):
-    """Run Stage1 first, then schedule a transition to agentic unified InfoNCE."""
+class PhasedAgenticUnifiedContrastiveLoss(AgenticUnifiedContrastiveLoss):
+    """Two-phase AUCL source schedule without falling back to the legacy Stage1 loss."""
 
     requires_planner_memory = True
 
     def __init__(self, cfg: Dict):
-        super().__init__()
+        super().__init__(cfg)
         agentic_cfg = cfg.get("agentic_contrastive", cfg.get("loss", {}).get("agentic_contrastive", {}))
         self.stage1_warmup_epochs = int(agentic_cfg.get("stage1_warmup_epochs", 30))
         self.schedule_mode = str(agentic_cfg.get("schedule_mode", agentic_cfg.get("switch_mode", "hard"))).lower()
@@ -1087,8 +1101,6 @@ class Stage1ScheduledAgenticUnifiedLoss(nn.Module):
             agentic_cfg.get("post_stage1_weight", agentic_cfg.get("stage1_keep_weight", 0.0))
         )
         self.post_stage1_weight = min(1.0, max(0.0, self.post_stage1_weight))
-        self.stage1_loss = RFClathLoss(cfg)
-        self.agentic_loss = AgenticUnifiedContrastiveLoss(cfg)
 
     def _current_epoch(self, outputs: Dict[str, torch.Tensor]) -> int:
         epoch = outputs.get("epoch", None)
@@ -1098,39 +1110,7 @@ class Stage1ScheduledAgenticUnifiedLoss(nn.Module):
             return int(epoch.detach().cpu().item())
         return int(epoch)
 
-    def _with_agentic_defaults(self, losses: Dict[str, torch.Tensor], device: torch.device) -> Dict[str, torch.Tensor]:
-        zero = torch.zeros((), device=device)
-        return {
-            **losses,
-            "component_agentic_contrastive": zero,
-            "loss_arf": zero,
-            "metric_agentic_raw": zero,
-            "metric_agentic_pos_view": zero,
-            "metric_agentic_pos_batch": zero,
-            "metric_agentic_pos_memory": zero,
-            "metric_agentic_pos_arf": zero,
-            "metric_agentic_hard_positive_count": zero,
-            "metric_agentic_hard_negative_count": zero,
-            "metric_agentic_positive_weight_mean": zero,
-            "metric_arf_target_count": zero,
-            "metric_arf_target_mean": zero,
-            "metric_arf_hard_positive_count": zero,
-            "metric_arf_hard_negative_count": zero,
-            "metric_arf_actual_overlap": zero,
-            "metric_arf_false_ratio": zero,
-            "metric_arf_missed_ratio": zero,
-            "metric_arf_retrieved_target_mean": zero,
-            "metric_arf_feedback_weight_mean": zero,
-            "metric_arf_eta_missed": zero,
-            "metric_arf_eta_false": zero,
-            "metric_arf_omega_z": zero,
-            "metric_arf_gamma": zero,
-            "metric_arf_lambda_quant": zero,
-            "metric_agentic_mix_alpha": zero,
-            "metric_stage1_keep_weight": torch.ones((), device=device),
-        }
-
-    def _weights(self, epoch: int) -> Tuple[float, float]:
+    def _phase_weights(self, epoch: int) -> Tuple[float, float]:
         if epoch <= self.stage1_warmup_epochs:
             return 1.0, 0.0
         if self.schedule_mode == "ramp":
@@ -1144,56 +1124,115 @@ class Stage1ScheduledAgenticUnifiedLoss(nn.Module):
             return self.post_stage1_weight, 1.0 - self.post_stage1_weight
         return self.post_stage1_weight, 1.0 - self.post_stage1_weight
 
-    def _with_schedule_metrics(
-        self,
-        losses: Dict[str, torch.Tensor],
-        device: torch.device,
-        stage1_weight: float,
-        agentic_weight: float,
-    ) -> Dict[str, torch.Tensor]:
+    def _effective_source_weights(self, agentic_alpha: float) -> Dict[str, float]:
+        alpha = min(1.0, max(0.0, float(agentic_alpha)))
         return {
-            **losses,
-            "metric_agentic_mix_alpha": torch.tensor(agentic_weight, device=device),
-            "metric_stage1_keep_weight": torch.tensor(stage1_weight, device=device),
+            "view": self.source_weight_view,
+            "batch_neighbor": self.source_weight_batch,
+            "memory_neighbor": self.source_weight_memory,
+            "arf_planned": alpha * self.source_weight_arf,
+            "arf_missed_bonus": alpha * self.source_weight_missed_bonus,
+            "hard_negative_weight": 1.0 + alpha * (self.hard_negative_weight - 1.0),
         }
-
-    def _combine_losses(
-        self,
-        stage1_losses: Dict[str, torch.Tensor],
-        agentic_losses: Dict[str, torch.Tensor],
-        device: torch.device,
-        stage1_weight: float,
-        agentic_weight: float,
-    ) -> Dict[str, torch.Tensor]:
-        zero = torch.zeros((), device=device)
-        combined: Dict[str, torch.Tensor] = {}
-        keys = set(stage1_losses) | set(agentic_losses)
-        for key in keys:
-            stage1_value = stage1_losses.get(key, zero)
-            agentic_value = agentic_losses.get(key, zero)
-            if key.startswith("metric_agentic_") or key.startswith("metric_arf_"):
-                combined[key] = agentic_value if agentic_weight > 0.0 else zero
-            else:
-                combined[key] = stage1_value * stage1_weight + agentic_value * agentic_weight
-        combined["loss"] = stage1_losses["loss"] * stage1_weight + agentic_losses["loss"] * agentic_weight
-        combined["metric_agentic_mix_alpha"] = torch.tensor(agentic_weight, device=device)
-        combined["metric_stage1_keep_weight"] = torch.tensor(stage1_weight, device=device)
-        return combined
 
     def forward(self, outputs: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
         epoch = self._current_epoch(outputs)
         device = outputs["u_a"].device
-        stage1_weight, agentic_weight = self._weights(epoch)
-        if agentic_weight <= 0.0:
-            losses = self._with_agentic_defaults(self.stage1_loss(outputs), device)
-            return self._with_schedule_metrics(losses, device, stage1_weight, agentic_weight)
-        if stage1_weight <= 0.0:
-            losses = self.agentic_loss(outputs)
-            return self._with_schedule_metrics(losses, device, stage1_weight, agentic_weight)
-        stage1_losses = self._with_agentic_defaults(self.stage1_loss(outputs), device)
-        agentic_losses = self.agentic_loss(outputs)
-        return self._combine_losses(stage1_losses, agentic_losses, device, stage1_weight, agentic_weight)
+        zero = torch.zeros((), device=device)
+        memory = outputs.get("planner_memory", None)
+        planner = outputs.get("graph_planner", None)
+        sample_indices = outputs.get("sample_indices", None)
+        neighbor_indices = outputs.get("neighbor_indices", None)
+        if memory is None or planner is None or sample_indices is None or neighbor_indices is None:
+            raise ValueError(
+                "PhasedAgenticUnifiedContrastiveLoss requires planner_memory, graph_planner, sample_indices, and neighbor_indices."
+            )
+
+        stage1_weight, agentic_alpha = self._phase_weights(epoch)
+        schedule = self._schedule(epoch)
+        if agentic_alpha <= 0.0 or (self.actual_trace_start_epoch > 0 and epoch < self.actual_trace_start_epoch):
+            schedule = dict(schedule)
+            schedule["use_actual_trace"] = False
+            schedule["eta_missed"] = 0.0
+            schedule["eta_false"] = 0.0
+        hard_mining_enabled = agentic_alpha > 0.0 and bool(schedule["use_actual_trace"]) and (
+            self.hard_mining_start_epoch <= 0 or epoch >= self.hard_mining_start_epoch
+        )
+
+        component_agentic, metrics = self._unified_info_nce(
+            outputs,
+            memory,
+            planner,
+            sample_indices,
+            neighbor_indices,
+            schedule,
+            hard_mining_enabled,
+            source_weights=self._effective_source_weights(agentic_alpha),
+        )
+        component_quant = self.quantization(outputs["u_a"], outputs["u_b"])
+        component_bit_balance = self.balance(outputs["u_a"], outputs["u_b"])
+        loss_hash = (
+            float(schedule["lambda_quant"]) * component_quant
+            + float(schedule["lambda_balance"]) * component_bit_balance
+        )
+        total = component_agentic + loss_hash
+
+        targets_a = metrics["targets_a"]
+        targets_b = metrics["targets_b"]
+
+        def avg_target_metric(key: str) -> torch.Tensor:
+            a = targets_a[key].to(device) if torch.is_tensor(targets_a[key]) else torch.tensor(targets_a[key], device=device)
+            b = targets_b[key].to(device) if torch.is_tensor(targets_b[key]) else torch.tensor(targets_b[key], device=device)
+            return 0.5 * (a.float() + b.float())
+
+        return {
+            "component_view_contrast": zero,
+            "component_batch_neighbor": zero,
+            "component_memory_neighbor": zero,
+            "component_arf_static": zero,
+            "component_arf_contrastive": zero,
+            "component_agentic_contrastive": component_agentic,
+            "component_quant": component_quant,
+            "component_bit_balance": component_bit_balance,
+            "loss_view": zero,
+            "loss_semantic": component_agentic,
+            "loss_arf": zero,
+            "loss_hash": loss_hash,
+            "loss": total,
+            "metric_agentic_raw": component_agentic.detach(),
+            "metric_agentic_pos_view": metrics["view_count"],
+            "metric_agentic_pos_batch": metrics["batch_count"],
+            "metric_agentic_pos_memory": metrics["memory_count"],
+            "metric_agentic_pos_arf": metrics["arf_count"],
+            "metric_agentic_hard_positive_count": metrics["hard_positive_count"],
+            "metric_agentic_hard_negative_count": metrics["hard_negative_count"],
+            "metric_agentic_positive_weight_mean": metrics["positive_weight"],
+            "metric_agentic_mix_alpha": torch.tensor(float(agentic_alpha), device=device),
+            "metric_stage1_keep_weight": torch.tensor(float(stage1_weight), device=device),
+            "metric_arf_target_count": 0.5
+            * (metrics["metrics_a"]["positive_count"].float() + metrics["metrics_b"]["positive_count"].float()),
+            "metric_arf_target_mean": 0.5
+            * (metrics["metrics_a"]["positive_mean"].float() + metrics["metrics_b"]["positive_mean"].float()),
+            "metric_arf_hard_positive_count": metrics["hard_positive_count"],
+            "metric_arf_hard_negative_count": metrics["hard_negative_count"],
+            "metric_arf_actual_overlap": avg_target_metric("metric_actual_overlap"),
+            "metric_arf_false_ratio": avg_target_metric("metric_false_ratio"),
+            "metric_arf_missed_ratio": avg_target_metric("metric_missed_ratio"),
+            "metric_arf_retrieved_target_mean": avg_target_metric("metric_retrieved_target_mean"),
+            "metric_arf_feedback_weight_mean": avg_target_metric("metric_feedback_weight_mean"),
+            "metric_arf_eta_missed": torch.tensor(float(schedule["eta_missed"]), device=device),
+            "metric_arf_eta_false": torch.tensor(float(schedule["eta_false"]), device=device),
+            "metric_arf_omega_z": torch.tensor(float(schedule["omega_z"]), device=device),
+            "metric_arf_gamma": torch.tensor(float(schedule["gamma"]), device=device),
+            "metric_arf_lambda_quant": torch.tensor(float(schedule["lambda_quant"]), device=device),
+        }
+
+    _weights = _phase_weights
+
+
+class Stage1ScheduledAgenticUnifiedLoss(PhasedAgenticUnifiedContrastiveLoss):
+    """Backward-compatible name for phased AUCL."""
 
 
 class Stage1WarmupAgenticUnifiedLoss(Stage1ScheduledAgenticUnifiedLoss):
-    """Backward-compatible hard-switch objective."""
+    """Backward-compatible hard-switch name for phased AUCL."""

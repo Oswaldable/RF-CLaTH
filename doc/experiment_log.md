@@ -1257,3 +1257,117 @@ schedule check:
 | HMDB51 | 16 | warmup60 short window, hard switch, stop at epoch110 | cuda2 | 2499853 | 2499860 | `/mnt/disk2/yql/RF-CLaTH_outputs/rf_clath_stage1warm60_short110_agentic_unified_v1_hmdb_disk2` | `/mnt/disk2/yql/RF-CLaTH_run_logs/rf_clath_stage1warm60_short110_agentic_unified_hmdb16_cuda2_launcher_20260611_003353.log` | `/mnt/disk2/yql/RF-CLaTH_run_logs/rf_clath_stage1warm60_short110_agentic_unified_v1_hmdb_disk2_20260611_003353.queue.log` | running |
 | HMDB51 | 16 | warmup60 ramp20 -> AgenticUnified | cuda3 | 2501110 | 2501119 | `/mnt/disk2/yql/RF-CLaTH_outputs/rf_clath_stage1warm60_ramp20_agentic_unified_v1_hmdb_disk2` | `/mnt/disk2/yql/RF-CLaTH_run_logs/rf_clath_stage1warm60_ramp20_agentic_unified_hmdb16_cuda3_launcher_20260611_003400.log` | `/mnt/disk2/yql/RF-CLaTH_run_logs/rf_clath_stage1warm60_ramp20_agentic_unified_v1_hmdb_disk2_20260611_003400.queue.log` | running |
 | HMDB51 | 16 | warmup60 retain50, 0.5 Stage1 + 0.5 AgenticUnified after switch | cuda0 | 2502301 | 2502308 | `/mnt/disk2/yql/RF-CLaTH_outputs/rf_clath_stage1warm60_retain50_agentic_unified_v1_hmdb_disk2` | `/mnt/disk2/yql/RF-CLaTH_run_logs/rf_clath_stage1warm60_retain50_agentic_unified_hmdb16_cuda0_launcher_20260611_003408.log` | `/mnt/disk2/yql/RF-CLaTH_run_logs/rf_clath_stage1warm60_retain50_agentic_unified_v1_hmdb_disk2_20260611_003408.queue.log` | running |
+
+Current status check:
+
+```text
+2026-06-11:
+
+Still running:
+  warmup40 hard switch:
+    train epoch: 124
+    latest eval epoch: 120
+    best epoch: 80
+    best mAP@100: 0.1022
+    latest mAP@100: 0.0977
+    interpretation: already peaked and decayed; no longer promising as a final setting.
+
+  warmup60 short110:
+    train epoch: 2
+    latest eval: none yet
+    mix_alpha=0.0, stage1_keep=1.0
+    interpretation: still in Stage1 warmup; no retrieval result yet.
+
+  warmup60 ramp20:
+    train epoch: 2
+    latest eval: none yet
+    mix_alpha=0.0, stage1_keep=1.0
+    interpretation: still in Stage1 warmup; ramp starts at epoch 61.
+
+  warmup60 retain50:
+    train epoch: 1
+    latest eval: none yet
+    mix_alpha=0.0, stage1_keep=1.0
+    interpretation: still in Stage1 warmup; 0.5/0.5 hybrid starts at epoch 61.
+
+Reference:
+  warmup60 hard switch completed:
+    best epoch: 105
+    best mAP@100: 0.1036
+    latest epoch 150 mAP@100: 0.1006
+```
+
+## 2026-06-11 True Two-Phase AUCL Implementation
+
+目的：把 `Stage1ScheduledAgenticUnifiedLoss` 从“旧 Stage1 loss + Agentic loss”改成真正的一个 AUCL loss 的两阶段 source schedule。
+
+实现后训练口径：
+
+```text
+L_total(t) =
+  L_AUCL(t)
++ 0.02 * L_quant
++ 0.03 * L_balance
+
+Phase I bootstrap:
+  source = {view, batch_neighbor, memory_neighbor}
+  arf_planned = 0
+  arf_missed_bonus = 0
+  hard_negative_weight = 1.0
+  actual_trace = false
+  hard_mining = false
+
+Phase II agentic refinement:
+  source = {view, batch_neighbor, memory_neighbor, arf_planned, arf_missed_bonus}
+  hard_negative_weight = 1.25
+  actual_trace = true
+  hard_mining = true
+```
+
+代码变更：
+
+```text
+losses/arf_loss.py:
+  Added PhasedAgenticUnifiedContrastiveLoss.
+  Stage1ScheduledAgenticUnifiedLoss now subclasses phased AUCL.
+  Stage1WarmupAgenticUnifiedLoss remains a compatibility alias.
+  Removed RFClathLoss dependency from scheduled/warmup AUCL objectives.
+
+engine/train.py:
+  Added phased_agentic_unified / phased_agentic_unified_contrastive objective aliases.
+
+tools:
+  Updated scheduled/warmup HMDB launch scripts to pass AUCL source weights instead of old Stage1 loss weights.
+```
+
+远端轻量验证：
+
+```text
+py_compile: passed
+bash -n scheduled script: passed
+bash -n warmup script: passed
+
+hard:
+  epoch 1:  mix_alpha=0.0, stage1_keep=1.0, arf=0.0, hard_negative=1.0
+  epoch 60: mix_alpha=0.0, stage1_keep=1.0, arf=0.0, hard_negative=1.0
+  epoch 61: mix_alpha=1.0, stage1_keep=0.0, arf=0.25, hard_negative=1.25
+
+ramp20:
+  epoch 61: mix_alpha=0.05, stage1_keep=0.95, arf=0.0125, hard_negative=1.0125
+  epoch 80: mix_alpha=1.0, stage1_keep=0.0, arf=0.25, hard_negative=1.25
+
+retain50:
+  epoch 61: mix_alpha=0.5, stage1_keep=0.5, arf=0.125, hard_negative=1.125
+
+aliases:
+  stage1_warmup_agentic_unified -> Phased AUCL
+  stage1_scheduled_agentic_unified -> Phased AUCL
+  phased_agentic_unified_contrastive -> Phased AUCL
+```
+
+备注：
+
+```text
+Current running experiments were not stopped. They keep the Python code loaded at process start.
+Future experiments launched from the updated scripts will use the true two-phase AUCL implementation.
+```

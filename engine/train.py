@@ -15,6 +15,7 @@ from losses import (
     AgenticUnifiedContrastiveLoss,
     ContrastiveARFLoss,
     HybridARFLoss,
+    PhasedAgenticUnifiedContrastiveLoss,
     RFClathLoss,
     Stage1ScheduledAgenticUnifiedLoss,
     Stage1WarmupAgenticUnifiedLoss,
@@ -78,6 +79,8 @@ def build_criterion(cfg: Dict) -> nn.Module:
         return AgenticUnifiedContrastiveLoss(cfg)
     if objective in {"stage1_warmup_agentic_unified", "stage1_then_agentic_unified"}:
         return Stage1WarmupAgenticUnifiedLoss(cfg)
+    if objective in {"phased_agentic_unified", "phased_agentic_unified_contrastive"}:
+        return PhasedAgenticUnifiedContrastiveLoss(cfg)
     if objective in {
         "stage1_scheduled_agentic_unified",
         "stage1_ramp_agentic_unified",

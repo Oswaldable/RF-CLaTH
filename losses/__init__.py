@@ -3,6 +3,7 @@ from .arf_loss import (
     AgenticUnifiedContrastiveLoss,
     ContrastiveARFLoss,
     HybridARFLoss,
+    PhasedAgenticUnifiedContrastiveLoss,
     Stage1ScheduledAgenticUnifiedLoss,
     Stage1WarmupAgenticUnifiedLoss,
     StaticARFLoss,
@@ -16,6 +17,7 @@ __all__ = [
     "HybridARFLoss",
     "ContrastiveARFLoss",
     "AgenticUnifiedContrastiveLoss",
+    "PhasedAgenticUnifiedContrastiveLoss",
     "Stage1ScheduledAgenticUnifiedLoss",
     "Stage1WarmupAgenticUnifiedLoss",
 ]
