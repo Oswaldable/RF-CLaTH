@@ -7,8 +7,11 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+from copy import deepcopy
+
 from .contrastive import AgenticMemoryNeighborContrastiveLoss, HashContrastiveLoss, NeighborHashContrastiveLoss
 from .hash_losses import BalanceLoss, QuantizationLoss
+from .total_loss import RFClathLoss
 
 
 def _get_nested(cfg: Dict, path: Tuple[str, ...], default=None):
@@ -1450,3 +1453,142 @@ class Stage1ScheduledAgenticUnifiedLoss(PhasedAgenticUnifiedContrastiveLoss):
 
 class Stage1WarmupAgenticUnifiedLoss(Stage1ScheduledAgenticUnifiedLoss):
     """Backward-compatible hard-switch name for phased AUCL."""
+
+
+class LegacyStage1ScheduledAgenticUnifiedLoss(nn.Module):
+    """Historical Stage1 loss followed by v1 single-pool AUCL.
+
+    This preserves the old switch-strategy experiment semantics after
+    ``stage1_warmup_agentic_unified`` was repointed to the true phased AUCL.
+    """
+
+    requires_planner_memory = True
+
+    def __init__(self, cfg: Dict):
+        super().__init__()
+        agentic_cfg = cfg.get("agentic_contrastive", cfg.get("loss", {}).get("agentic_contrastive", {}))
+        self.stage1_warmup_epochs = int(agentic_cfg.get("stage1_warmup_epochs", 30))
+        self.schedule_mode = str(agentic_cfg.get("schedule_mode", agentic_cfg.get("switch_mode", "hard"))).lower()
+        self.ramp_epochs = max(0, int(agentic_cfg.get("ramp_epochs", 0)))
+        self.post_stage1_weight = float(
+            agentic_cfg.get("post_stage1_weight", agentic_cfg.get("stage1_keep_weight", 0.0))
+        )
+        self.post_stage1_weight = min(1.0, max(0.0, self.post_stage1_weight))
+
+        stage1_cfg = deepcopy(cfg)
+        stage1_override = agentic_cfg.get("stage1_lambda_memory_neighbor", None)
+        if stage1_override is not None:
+            stage1_loss_cfg = stage1_cfg.setdefault("loss", {})
+            stage1_semantic_cfg = stage1_loss_cfg.setdefault("semantic", {})
+            stage1_semantic_cfg["lambda_memory_neighbor"] = float(stage1_override)
+
+        self.stage1_loss = RFClathLoss(stage1_cfg)
+        self.agentic_loss = AgenticUnifiedContrastiveLoss(cfg)
+
+    def _current_epoch(self, outputs: Dict[str, torch.Tensor]) -> int:
+        epoch = outputs.get("epoch", None)
+        if epoch is None:
+            return 1
+        if torch.is_tensor(epoch):
+            return int(epoch.detach().cpu().item())
+        return int(epoch)
+
+    def _with_agentic_defaults(self, losses: Dict[str, torch.Tensor], device: torch.device) -> Dict[str, torch.Tensor]:
+        zero = torch.zeros((), device=device)
+        return {
+            **losses,
+            "component_agentic_contrastive": zero,
+            "loss_arf": zero,
+            "metric_agentic_raw": zero,
+            "metric_agentic_pos_view": zero,
+            "metric_agentic_pos_batch": zero,
+            "metric_agentic_pos_memory": zero,
+            "metric_agentic_pos_arf": zero,
+            "metric_agentic_hard_positive_count": zero,
+            "metric_agentic_hard_negative_count": zero,
+            "metric_agentic_positive_weight_mean": zero,
+            "metric_agentic_mix_alpha": zero,
+            "metric_stage1_keep_weight": torch.ones((), device=device),
+            "metric_arf_target_count": zero,
+            "metric_arf_target_mean": zero,
+            "metric_arf_hard_positive_count": zero,
+            "metric_arf_hard_negative_count": zero,
+            "metric_arf_actual_overlap": zero,
+            "metric_arf_false_ratio": zero,
+            "metric_arf_missed_ratio": zero,
+            "metric_arf_retrieved_target_mean": zero,
+            "metric_arf_feedback_weight_mean": zero,
+            "metric_arf_eta_missed": zero,
+            "metric_arf_eta_false": zero,
+            "metric_arf_omega_z": zero,
+            "metric_arf_gamma": zero,
+            "metric_arf_lambda_quant": zero,
+        }
+
+    def _weights(self, epoch: int) -> Tuple[float, float]:
+        if epoch <= self.stage1_warmup_epochs:
+            return 1.0, 0.0
+        if self.schedule_mode == "ramp":
+            if self.ramp_epochs <= 0:
+                progress = 1.0
+            else:
+                progress = min(1.0, max(0.0, float(epoch - self.stage1_warmup_epochs) / float(self.ramp_epochs)))
+            stage1_weight = 1.0 - progress * (1.0 - self.post_stage1_weight)
+            return stage1_weight, 1.0 - stage1_weight
+        if self.schedule_mode in {"hybrid", "retain_stage1", "retained_stage1"}:
+            return self.post_stage1_weight, 1.0 - self.post_stage1_weight
+        return self.post_stage1_weight, 1.0 - self.post_stage1_weight
+
+    def _with_schedule_metrics(
+        self,
+        losses: Dict[str, torch.Tensor],
+        device: torch.device,
+        stage1_weight: float,
+        agentic_weight: float,
+    ) -> Dict[str, torch.Tensor]:
+        return {
+            **losses,
+            "metric_agentic_mix_alpha": torch.tensor(agentic_weight, device=device),
+            "metric_stage1_keep_weight": torch.tensor(stage1_weight, device=device),
+        }
+
+    def _combine_losses(
+        self,
+        stage1_losses: Dict[str, torch.Tensor],
+        agentic_losses: Dict[str, torch.Tensor],
+        device: torch.device,
+        stage1_weight: float,
+        agentic_weight: float,
+    ) -> Dict[str, torch.Tensor]:
+        zero = torch.zeros((), device=device)
+        combined: Dict[str, torch.Tensor] = {}
+        keys = set(stage1_losses) | set(agentic_losses)
+        for key in keys:
+            stage1_value = stage1_losses.get(key, zero)
+            agentic_value = agentic_losses.get(key, zero)
+            if key.startswith("metric_agentic_") or key.startswith("metric_arf_"):
+                combined[key] = agentic_value if agentic_weight > 0.0 else zero
+            else:
+                combined[key] = stage1_value * stage1_weight + agentic_value * agentic_weight
+        combined["loss"] = stage1_losses["loss"] * stage1_weight + agentic_losses["loss"] * agentic_weight
+        combined["metric_agentic_mix_alpha"] = torch.tensor(agentic_weight, device=device)
+        combined["metric_stage1_keep_weight"] = torch.tensor(stage1_weight, device=device)
+        return combined
+
+    def forward(self, outputs: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+        epoch = self._current_epoch(outputs)
+        device = outputs["u_a"].device
+        stage1_weight, agentic_weight = self._weights(epoch)
+        if agentic_weight <= 0.0:
+            losses = self._with_agentic_defaults(self.stage1_loss(outputs), device)
+            return self._with_schedule_metrics(losses, device, stage1_weight, agentic_weight)
+        if stage1_weight <= 0.0:
+            losses = self.agentic_loss(outputs)
+            return self._with_schedule_metrics(losses, device, stage1_weight, agentic_weight)
+        stage1_losses = self._with_agentic_defaults(self.stage1_loss(outputs), device)
+        agentic_losses = self.agentic_loss(outputs)
+        return self._combine_losses(stage1_losses, agentic_losses, device, stage1_weight, agentic_weight)
+
+
+class LegacyStage1WarmupAgenticUnifiedLoss(LegacyStage1ScheduledAgenticUnifiedLoss):
+    """Historical hard switch: Stage1 RFClathLoss, then v1 AUCL."""
