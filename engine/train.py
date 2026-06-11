@@ -16,6 +16,7 @@ from losses import (
     ContrastiveARFLoss,
     HybridARFLoss,
     RFClathLoss,
+    Stage1ScheduledAgenticUnifiedLoss,
     Stage1WarmupAgenticUnifiedLoss,
     StaticARFLoss,
 )
@@ -77,6 +78,13 @@ def build_criterion(cfg: Dict) -> nn.Module:
         return AgenticUnifiedContrastiveLoss(cfg)
     if objective in {"stage1_warmup_agentic_unified", "stage1_then_agentic_unified"}:
         return Stage1WarmupAgenticUnifiedLoss(cfg)
+    if objective in {
+        "stage1_scheduled_agentic_unified",
+        "stage1_ramp_agentic_unified",
+        "stage1_retained_agentic_unified",
+        "stage1_hybrid_agentic_unified",
+    }:
+        return Stage1ScheduledAgenticUnifiedLoss(cfg)
     return RFClathLoss(cfg)
 
 
@@ -216,7 +224,7 @@ def train_one_epoch(
                 "arf_weight=%.3f eta_m=%.3f eta_f=%.3f omega_z=%.3f arf_gamma=%.1f "
                 "agentic_raw=%.4f agentic_pos_view=%.1f agentic_pos_batch=%.1f "
                 "agentic_pos_memory=%.1f agentic_pos_arf=%.1f agentic_hpos=%.1f "
-                "agentic_hneg=%.1f agentic_pos_weight=%.3f "
+                "agentic_hneg=%.1f agentic_pos_weight=%.3f mix_alpha=%.3f stage1_keep=%.3f "
                 "agree=%.3f hamm=%.3f entropy=%.3f bit_use=%.3f sat=%.3f mask=%.3f fast_cos=%.3f",
                 epoch,
                 step,
@@ -252,6 +260,8 @@ def train_one_epoch(
                 float(losses.get("metric_agentic_hard_positive_count", torch.zeros((), device=device)).detach().cpu()),
                 float(losses.get("metric_agentic_hard_negative_count", torch.zeros((), device=device)).detach().cpu()),
                 float(losses.get("metric_agentic_positive_weight_mean", torch.zeros((), device=device)).detach().cpu()),
+                float(losses.get("metric_agentic_mix_alpha", torch.zeros((), device=device)).detach().cpu()),
+                float(losses.get("metric_stage1_keep_weight", torch.zeros((), device=device)).detach().cpu()),
                 hash_metrics["metric_hash_agree"],
                 hash_metrics["metric_hamm_norm"],
                 hash_metrics["metric_bit_entropy"],
@@ -297,7 +307,7 @@ def train_one_epoch(
         "arf_weight=%.3f eta_m=%.3f eta_f=%.3f omega_z=%.3f arf_gamma=%.1f "
         "agentic_raw=%.4f agentic_pos_view=%.1f agentic_pos_batch=%.1f "
         "agentic_pos_memory=%.1f agentic_pos_arf=%.1f agentic_hpos=%.1f "
-        "agentic_hneg=%.1f agentic_pos_weight=%.3f "
+        "agentic_hneg=%.1f agentic_pos_weight=%.3f mix_alpha=%.3f stage1_keep=%.3f "
         "agree=%.3f hamm=%.3f entropy=%.3f bit_use=%.3f balance_abs=%.3f sat=%.3f std=%.3f pos=%.3f mask=%.3f fast_cos=%.3f fused_cos=%.3f",
         epoch,
         time.time() - start,
@@ -332,6 +342,8 @@ def train_one_epoch(
         averaged.get("metric_agentic_hard_positive_count", 0.0),
         averaged.get("metric_agentic_hard_negative_count", 0.0),
         averaged.get("metric_agentic_positive_weight_mean", 0.0),
+        averaged.get("metric_agentic_mix_alpha", 0.0),
+        averaged.get("metric_stage1_keep_weight", 0.0),
         averaged.get("metric_hash_agree", 0.0),
         averaged.get("metric_hamm_norm", 0.0),
         averaged.get("metric_bit_entropy", 0.0),

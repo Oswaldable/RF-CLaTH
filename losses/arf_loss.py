@@ -1072,8 +1072,8 @@ class AgenticUnifiedContrastiveLoss(ContrastiveARFLoss):
         }
 
 
-class Stage1WarmupAgenticUnifiedLoss(nn.Module):
-    """Run original Stage1 loss first, then switch to agentic unified InfoNCE."""
+class Stage1ScheduledAgenticUnifiedLoss(nn.Module):
+    """Run Stage1 first, then schedule a transition to agentic unified InfoNCE."""
 
     requires_planner_memory = True
 
@@ -1081,6 +1081,12 @@ class Stage1WarmupAgenticUnifiedLoss(nn.Module):
         super().__init__()
         agentic_cfg = cfg.get("agentic_contrastive", cfg.get("loss", {}).get("agentic_contrastive", {}))
         self.stage1_warmup_epochs = int(agentic_cfg.get("stage1_warmup_epochs", 30))
+        self.schedule_mode = str(agentic_cfg.get("schedule_mode", agentic_cfg.get("switch_mode", "hard"))).lower()
+        self.ramp_epochs = max(0, int(agentic_cfg.get("ramp_epochs", 0)))
+        self.post_stage1_weight = float(
+            agentic_cfg.get("post_stage1_weight", agentic_cfg.get("stage1_keep_weight", 0.0))
+        )
+        self.post_stage1_weight = min(1.0, max(0.0, self.post_stage1_weight))
         self.stage1_loss = RFClathLoss(cfg)
         self.agentic_loss = AgenticUnifiedContrastiveLoss(cfg)
 
@@ -1120,10 +1126,74 @@ class Stage1WarmupAgenticUnifiedLoss(nn.Module):
             "metric_arf_omega_z": zero,
             "metric_arf_gamma": zero,
             "metric_arf_lambda_quant": zero,
+            "metric_agentic_mix_alpha": zero,
+            "metric_stage1_keep_weight": torch.ones((), device=device),
         }
+
+    def _weights(self, epoch: int) -> Tuple[float, float]:
+        if epoch <= self.stage1_warmup_epochs:
+            return 1.0, 0.0
+        if self.schedule_mode == "ramp":
+            if self.ramp_epochs <= 0:
+                progress = 1.0
+            else:
+                progress = min(1.0, max(0.0, float(epoch - self.stage1_warmup_epochs) / float(self.ramp_epochs)))
+            stage1_weight = 1.0 - progress * (1.0 - self.post_stage1_weight)
+            return stage1_weight, 1.0 - stage1_weight
+        if self.schedule_mode in {"hybrid", "retain_stage1", "retained_stage1"}:
+            return self.post_stage1_weight, 1.0 - self.post_stage1_weight
+        return self.post_stage1_weight, 1.0 - self.post_stage1_weight
+
+    def _with_schedule_metrics(
+        self,
+        losses: Dict[str, torch.Tensor],
+        device: torch.device,
+        stage1_weight: float,
+        agentic_weight: float,
+    ) -> Dict[str, torch.Tensor]:
+        return {
+            **losses,
+            "metric_agentic_mix_alpha": torch.tensor(agentic_weight, device=device),
+            "metric_stage1_keep_weight": torch.tensor(stage1_weight, device=device),
+        }
+
+    def _combine_losses(
+        self,
+        stage1_losses: Dict[str, torch.Tensor],
+        agentic_losses: Dict[str, torch.Tensor],
+        device: torch.device,
+        stage1_weight: float,
+        agentic_weight: float,
+    ) -> Dict[str, torch.Tensor]:
+        zero = torch.zeros((), device=device)
+        combined: Dict[str, torch.Tensor] = {}
+        keys = set(stage1_losses) | set(agentic_losses)
+        for key in keys:
+            stage1_value = stage1_losses.get(key, zero)
+            agentic_value = agentic_losses.get(key, zero)
+            if key.startswith("metric_agentic_") or key.startswith("metric_arf_"):
+                combined[key] = agentic_value if agentic_weight > 0.0 else zero
+            else:
+                combined[key] = stage1_value * stage1_weight + agentic_value * agentic_weight
+        combined["loss"] = stage1_losses["loss"] * stage1_weight + agentic_losses["loss"] * agentic_weight
+        combined["metric_agentic_mix_alpha"] = torch.tensor(agentic_weight, device=device)
+        combined["metric_stage1_keep_weight"] = torch.tensor(stage1_weight, device=device)
+        return combined
 
     def forward(self, outputs: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
         epoch = self._current_epoch(outputs)
-        if epoch <= self.stage1_warmup_epochs:
-            return self._with_agentic_defaults(self.stage1_loss(outputs), outputs["u_a"].device)
-        return self.agentic_loss(outputs)
+        device = outputs["u_a"].device
+        stage1_weight, agentic_weight = self._weights(epoch)
+        if agentic_weight <= 0.0:
+            losses = self._with_agentic_defaults(self.stage1_loss(outputs), device)
+            return self._with_schedule_metrics(losses, device, stage1_weight, agentic_weight)
+        if stage1_weight <= 0.0:
+            losses = self.agentic_loss(outputs)
+            return self._with_schedule_metrics(losses, device, stage1_weight, agentic_weight)
+        stage1_losses = self._with_agentic_defaults(self.stage1_loss(outputs), device)
+        agentic_losses = self.agentic_loss(outputs)
+        return self._combine_losses(stage1_losses, agentic_losses, device, stage1_weight, agentic_weight)
+
+
+class Stage1WarmupAgenticUnifiedLoss(Stage1ScheduledAgenticUnifiedLoss):
+    """Backward-compatible hard-switch objective."""

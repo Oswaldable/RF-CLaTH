@@ -992,3 +992,268 @@ temporary actual_trace_start_epoch=1 / hard_mining_start_epoch=1:
 Stage1 HMDB16 best mAP@100 = 0.0994
 A missed-positive best mAP@100 = 0.0993
 ```
+
+Update:
+
+```text
+cuda0 run stopped before checkpoint due GPU load.
+Restarted direct Agentic Unified v1 on cuda2:
+  launcher PID: 564028
+  train PID: 564035
+  run: /mnt/disk2/yql/RF-CLaTH_outputs/rf_clath_agentic_unified_v1_cuda2_hmdb_disk2/hmdb_16b_20260610_152357
+  queue log: /mnt/disk2/yql/RF-CLaTH_run_logs/rf_clath_agentic_unified_v1_cuda2_hmdb_disk2_20260610_152356.queue.log
+```
+
+## 2026-06-10 Stage1 Warmup 50 -> Agentic Unified v1
+
+目的：先用已验证稳定的 Stage1 original loss 建立检索空间，再切换到 agentic unified contrastive 进行 retrieval-feedback refinement。
+
+训练策略：
+
+```text
+epoch 1-50:
+  0.30 * L_view
++ 0.50 * L_batch_neighbor
++ 0.04 * L_memory_neighbor
++ 0.02 * L_quant
++ 0.03 * L_balance
+
+epoch 51-150:
+  L_agentic_unified_contrastive
++ 0.02 * L_quant
++ 0.03 * L_balance
+
+actual_trace_start_epoch = 51
+hard_mining_start_epoch = 51
+```
+
+实现：
+
+```text
+objective: stage1_warmup_agentic_unified
+loss wrapper: Stage1WarmupAgenticUnifiedLoss
+script: tools/run_rf_clath_hmdb_stage1_warmup_agentic_unified_disk2.sh
+```
+
+启动记录：
+
+| Dataset | Bit | Experiment | GPU | Launcher PID | Train PID | Train Dir | Launcher Log | Queue Log | Status |
+|---|---:|---|---:|---:|---:|---|---|---|---|
+| HMDB51 | 16 | Stage1 warmup 50 -> Agentic Unified v1 | cuda3 | 645235 | 645242 | `/mnt/disk2/yql/RF-CLaTH_outputs/rf_clath_stage1warm50_agentic_unified_v1_hmdb_disk2/hmdb_16b_20260610_154220` | `/mnt/disk2/yql/RF-CLaTH_run_logs/rf_clath_stage1warm50_agentic_unified_hmdb16_cuda3_launcher_20260610_154218.log` | `/mnt/disk2/yql/RF-CLaTH_run_logs/rf_clath_stage1warm50_agentic_unified_v1_hmdb_disk2_20260610_154218.queue.log` | running |
+
+停止记录（2026-06-11）：
+
+```text
+Stopped direct Agentic Unified v1 on cuda2:
+  run: /mnt/disk2/yql/RF-CLaTH_outputs/rf_clath_agentic_unified_v1_cuda2_hmdb_disk2/hmdb_16b_20260610_152357
+  stopped at train epoch 61
+  best eval epoch 45:
+    mAP@5   = 0.1916
+    mAP@20  = 0.1317
+    mAP@40  = 0.1022
+    mAP@60  = 0.0840
+    mAP@80  = 0.0708
+    mAP@100 = 0.0618
+    P@100   = 0.1418
+    R@100   = 0.1891
+  last eval epoch 60:
+    mAP@100 = 0.0615
+  conclusion:
+    Directly replacing Stage1 with unified agentic contrastive is clearly worse than Stage1 HMDB16 mAP@100=0.0994.
+
+Stopped Stage1 warmup 50 -> Agentic Unified v1 on cuda3:
+  run: /mnt/disk2/yql/RF-CLaTH_outputs/rf_clath_stage1warm50_agentic_unified_v1_hmdb_disk2/hmdb_16b_20260610_154220
+  stopped at train epoch 116
+  best eval epoch 65:
+    mAP@5   = 0.3221
+    mAP@20  = 0.2465
+    mAP@40  = 0.1915
+    mAP@60  = 0.1524
+    mAP@80  = 0.1219
+    mAP@100 = 0.1018
+    P@100   = 0.1724
+    R@100   = 0.2298
+  last eval epoch 115:
+    mAP@100 = 0.1003
+  last agentic diagnostics, train epoch 116:
+    agentic_raw        = 3.8456
+    agentic_pos_view   = 1.1
+    agentic_pos_batch  = 7.5
+    agentic_pos_memory = 10.0
+    agentic_pos_arf    = 14.7
+    agentic_hpos       = 2.5
+    agentic_hneg       = 7.7
+    agentic_pos_weight = 0.092
+  conclusion:
+    Warmup switch improves over Stage1 HMDB16 mAP@100=0.0994 by +0.0024, but the peak appears soon after switching and then mildly decays.
+    Next tuning should focus on switch timing, switch ramp, and whether to keep part of Stage1 contrastive after the switch.
+```
+
+Correction / resume:
+
+```text
+The Stage1 warmup 50 -> Agentic Unified v1 run should not have been stopped.
+It was resumed from:
+  /mnt/disk2/yql/RF-CLaTH_outputs/rf_clath_stage1warm50_agentic_unified_v1_hmdb_disk2/hmdb_16b_20260610_154220/epoch_0115.pth
+
+Resume command status:
+  GPU: cuda3
+  PID: 1008191
+  start_epoch: 116
+  resume log: /mnt/disk2/yql/RF-CLaTH_run_logs/rf_clath_stage1warm50_agentic_unified_resume_hmdb16_cuda3_20260610_171639.log
+
+Keep this run as the active switch-strategy baseline and continue it to epoch 150 unless the next tuning plan replaces it.
+```
+
+## 2026-06-11 Switch Timing Sweep: Warmup 40 / 50 / 60
+
+目的：验证 agentic unified contrastive 的最佳切换时机。当前证据显示直接使用 agentic unified 会崩，warmup50 硬切能小幅超过 Stage1，但切后长训会回落。因此先固定损失形式，只 sweep 切换 epoch。
+
+共同设置：
+
+```text
+dataset: HMDB51
+bits: 16
+batch_size: 256
+epoch 1-warmup:
+  0.30 * L_view
++ 0.50 * L_batch_neighbor
++ 0.04 * L_memory_neighbor
++ 0.02 * L_quant
++ 0.03 * L_balance
+
+epoch warmup+1 - 150:
+  L_agentic_unified_contrastive
++ 0.02 * L_quant
++ 0.03 * L_balance
+
+actual_trace_start_epoch = warmup + 1
+hard_mining_start_epoch  = warmup + 1
+```
+
+启动记录：
+
+| Dataset | Bit | Experiment | GPU | Launcher PID | Train PID | Train Dir | Launcher Log | Queue Log | Status |
+|---|---:|---|---:|---:|---:|---|---|---|---|
+| HMDB51 | 16 | Stage1 warmup 40 -> Agentic Unified v1 | cuda0 | 1018108 | 1018121 | `/mnt/disk2/yql/RF-CLaTH_outputs/rf_clath_stage1warm40_agentic_unified_v1_hmdb_disk2` | `/mnt/disk2/yql/RF-CLaTH_run_logs/rf_clath_stage1warm40_agentic_unified_hmdb16_cuda0_launcher_20260610_171903.log` | `/mnt/disk2/yql/RF-CLaTH_run_logs/rf_clath_stage1warm40_agentic_unified_v1_hmdb_disk2_20260610_171903.queue.log` | running |
+| HMDB51 | 16 | Stage1 warmup 50 -> Agentic Unified v1 | cuda3 | resumed | 1008191 | `/mnt/disk2/yql/RF-CLaTH_outputs/rf_clath_stage1warm50_agentic_unified_v1_hmdb_disk2/hmdb_16b_20260610_154220` | `/mnt/disk2/yql/RF-CLaTH_run_logs/rf_clath_stage1warm50_agentic_unified_resume_hmdb16_cuda3_20260610_171639.log` | `/mnt/disk2/yql/RF-CLaTH_run_logs/rf_clath_stage1warm50_agentic_unified_v1_hmdb_disk2_20260610_154218.queue.log` | running from epoch 116 |
+| HMDB51 | 16 | Stage1 warmup 60 -> Agentic Unified v1 | cuda2 | 1018110 | 1018124 | `/mnt/disk2/yql/RF-CLaTH_outputs/rf_clath_stage1warm60_agentic_unified_v1_hmdb_disk2` | `/mnt/disk2/yql/RF-CLaTH_run_logs/rf_clath_stage1warm60_agentic_unified_hmdb16_cuda2_launcher_20260610_171903.log` | `/mnt/disk2/yql/RF-CLaTH_run_logs/rf_clath_stage1warm60_agentic_unified_v1_hmdb_disk2_20260610_171903.queue.log` | running |
+
+判定口径：
+
+```text
+Primary: best mAP@100
+Secondary: mAP@20 / P@100 / R@100
+Watch:
+  peak epoch after switch
+  whether mAP@100 decays after peak
+  agentic_hpos / agentic_hneg activation after switch
+```
+
+阶段结果（2026-06-11）：
+
+| Experiment | Status | Best Epoch | Best mAP@20 | Best mAP@100 | P@100 | R@100 | Last Eval | Last mAP@100 |
+|---|---|---:|---:|---:|---:|---:|---:|---:|
+| warmup40 -> epoch41 switch | running, train epoch 98 | 80 | 0.2480 | 0.1022 | 0.1684 | 0.2245 | 95 | 0.0976 |
+| warmup50 -> epoch51 switch | finished epoch 150 | 65 | 0.2465 | 0.1018 | 0.1724 | 0.2298 | 150 | 0.0983 |
+| warmup60 -> epoch61 switch | finished epoch 150 | 105 | 0.2479 | 0.1036 | 0.1714 | 0.2285 | 150 | 0.1006 |
+
+对比：
+
+```text
+Stage1 HMDB16 baseline:
+  best mAP@100 = 0.0994
+
+warmup40:
+  best mAP@100 = 0.1022, +0.0028 over Stage1
+  peak appears around epoch 80, then decays to 0.0976 by epoch 95.
+
+warmup50:
+  best mAP@100 = 0.1018, +0.0024 over Stage1
+  peak appears around epoch 65, then decays to 0.0983 by epoch 150.
+
+warmup60:
+  best mAP@100 = 0.1036, +0.0042 over Stage1
+  peak appears around epoch 105, then decays to 0.1006 by epoch 150.
+```
+
+当前判断：
+
+```text
+1. warmup60 is the best current switch timing.
+2. All hard-switch variants show post-peak decay.
+3. Agentic hard mining is active and stable after switch:
+   warm40 latest agentic_hpos=2.6, agentic_hneg=7.8
+   warm50 latest agentic_hpos=2.4, agentic_hneg=7.7
+   warm60 latest agentic_hpos=2.5, agentic_hneg=7.9
+4. Next experiment should not be another earlier hard switch.
+   More promising:
+     a) warmup60 with early stop / short post-switch window
+     b) warmup60 with Stage1-to-agentic ramp
+     c) warmup60 with partial Stage1 contrastive retained after switch
+```
+
+## 2026-06-11 Warmup60 Switch-Strategy Follow-up
+
+目的：基于 warmup60 hard switch 的当前最佳结果，继续验证三条切换策略：
+
+```text
+baseline in this branch:
+  warmup60 hard switch
+  best epoch 105
+  best mAP@100 = 0.1036
+
+new variants:
+  1. short window:
+     warmup60 hard switch, run_until_epoch=110
+
+  2. ramp:
+     epoch 1-60 Stage1
+     epoch 61-80 linear ramp from Stage1 to AgenticUnified
+     epoch 81-150 AgenticUnified
+
+  3. retain Stage1:
+     epoch 1-60 Stage1
+     epoch 61-150 0.5 * Stage1 + 0.5 * AgenticUnified
+```
+
+实现：
+
+```text
+loss wrapper: Stage1ScheduledAgenticUnifiedLoss
+objective: stage1_scheduled_agentic_unified
+script: tools/run_rf_clath_hmdb_stage1_scheduled_agentic_unified_disk2.sh
+
+new schedule diagnostics:
+  mix_alpha
+  stage1_keep
+```
+
+远端验证：
+
+```text
+py_compile: passed
+bash -n scheduled script: passed
+
+schedule check:
+  hard:
+    epoch60 -> (stage1=1.0, agentic=0.0)
+    epoch61 -> (stage1=0.0, agentic=1.0)
+
+  ramp20:
+    epoch60 -> (stage1=1.0, agentic=0.0)
+    epoch61 -> (stage1=0.95, agentic=0.05)
+    epoch80 -> (stage1=0.0, agentic=1.0)
+
+  retain50:
+    epoch60 -> (stage1=1.0, agentic=0.0)
+    epoch61+ -> (stage1=0.5, agentic=0.5)
+```
+
+启动记录：
+
+| Dataset | Bit | Experiment | GPU | Launcher PID | Train PID | Train Dir | Launcher Log | Queue Log | Status |
+|---|---:|---|---:|---:|---:|---|---|---|---|
+| HMDB51 | 16 | warmup60 short window, hard switch, stop at epoch110 | cuda2 | 2499853 | 2499860 | `/mnt/disk2/yql/RF-CLaTH_outputs/rf_clath_stage1warm60_short110_agentic_unified_v1_hmdb_disk2` | `/mnt/disk2/yql/RF-CLaTH_run_logs/rf_clath_stage1warm60_short110_agentic_unified_hmdb16_cuda2_launcher_20260611_003353.log` | `/mnt/disk2/yql/RF-CLaTH_run_logs/rf_clath_stage1warm60_short110_agentic_unified_v1_hmdb_disk2_20260611_003353.queue.log` | running |
+| HMDB51 | 16 | warmup60 ramp20 -> AgenticUnified | cuda3 | 2501110 | 2501119 | `/mnt/disk2/yql/RF-CLaTH_outputs/rf_clath_stage1warm60_ramp20_agentic_unified_v1_hmdb_disk2` | `/mnt/disk2/yql/RF-CLaTH_run_logs/rf_clath_stage1warm60_ramp20_agentic_unified_hmdb16_cuda3_launcher_20260611_003400.log` | `/mnt/disk2/yql/RF-CLaTH_run_logs/rf_clath_stage1warm60_ramp20_agentic_unified_v1_hmdb_disk2_20260611_003400.queue.log` | running |
+| HMDB51 | 16 | warmup60 retain50, 0.5 Stage1 + 0.5 AgenticUnified after switch | cuda0 | 2502301 | 2502308 | `/mnt/disk2/yql/RF-CLaTH_outputs/rf_clath_stage1warm60_retain50_agentic_unified_v1_hmdb_disk2` | `/mnt/disk2/yql/RF-CLaTH_run_logs/rf_clath_stage1warm60_retain50_agentic_unified_hmdb16_cuda0_launcher_20260611_003408.log` | `/mnt/disk2/yql/RF-CLaTH_run_logs/rf_clath_stage1warm60_retain50_agentic_unified_v1_hmdb_disk2_20260611_003408.queue.log` | running |
