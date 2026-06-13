@@ -1598,3 +1598,96 @@ epoch 80 后 hard mining 正常开启，late epoch 典型值：
   aucl_memory_raw ~= 2.71
   aucl_memory_feedback ~= 2.16
 ```
+
+## 2026-06-11 Legacy Stage1-No-Memory Warmup60 -> Agentic Unified v1 HMDB16
+
+目的：验证当前最好方向 `warmup60 -> epoch61 hard switch` 中，Phase I 去掉 `L_memory_neighbor`
+是否改善后续 v1 AUCL 切换效果。
+
+实现口径：
+
+```text
+objective: legacy_stage1_warmup_agentic_unified
+loss wrapper: LegacyStage1WarmupAgenticUnifiedLoss
+
+epoch 1-60:
+  0.30 * L_view
++ 0.50 * L_batch_neighbor
++ 0.00 * L_memory_neighbor
++ 0.02 * L_quant
++ 0.03 * L_balance
+
+epoch 61-150:
+  L_agentic_unified_contrastive_v1
++ 0.02 * L_quant
++ 0.03 * L_balance
+
+actual_trace_start_epoch = 61
+hard_mining_start_epoch = 61
+```
+
+远端轻量验证：
+
+```text
+py_compile: passed
+bash -n: passed
+criterion smoke:
+  class: LegacyStage1WarmupAgenticUnifiedLoss
+  stage1_memory_lambda: 0.0
+  agentic_memory_source: 0.25
+  weights60: (1.0, 0.0)
+  weights61: (0.0, 1.0)
+```
+
+启动记录：
+
+| Dataset | Bit | Experiment | GPU | Launcher PID | Train PID | Train Dir | Launcher Log | Queue Log | Status |
+|---|---:|---|---:|---:|---:|---|---|---|---|
+| HMDB51 | 16 | legacy Stage1-no-memory warmup60 -> AUCL v1 hard switch | cuda2 | 1005259 | 1005270 | `/mnt/disk2/yql/RF-CLaTH_outputs/rf_clath_legacy_stage1nomem_warm60_agentic_unified_v1_hmdb_disk2/hmdb_16b_20260611_152256` | `/mnt/disk2/yql/RF-CLaTH_run_logs/rf_clath_legacy_stage1nomem_warm60_agentic_unified_hmdb16_cuda2_launcher_20260611_152255.log` | `/mnt/disk2/yql/RF-CLaTH_run_logs/rf_clath_legacy_stage1nomem_warm60_agentic_unified_v1_hmdb_disk2_20260611_152255.queue.log` | completed |
+
+首个训练 sanity：
+
+```text
+epoch=1 step=20/29
+loss=4.3943
+view_raw=3.2502
+batch_neigh=2.2693
+mem_neigh=0.0000
+agentic_raw=0.0000
+mix_alpha=0.000
+stage1_keep=1.000
+```
+
+完成结果：
+
+| Dataset | Bit | Experiment | Best Epoch | mAP@5 | mAP@20 | mAP@40 | mAP@60 | mAP@80 | mAP@100 | P@100 | R@100 | Last Epoch | Last mAP@100 |
+|---|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| HMDB51 | 16 | legacy Stage1-no-memory warmup60 -> AUCL v1 hard switch | 110 | 0.3131 | 0.2364 | 0.1827 | 0.1442 | 0.1149 | 0.0958 | 0.1610 | 0.2147 | 150 | 0.0954 |
+
+关键 eval：
+
+```text
+epoch 60  mAP@100 = 0.0551
+epoch 65  mAP@100 = 0.0680
+epoch 80  mAP@100 = 0.0851
+epoch 100 mAP@100 = 0.0948
+epoch 110 mAP@100 = 0.0958  best
+epoch 150 mAP@100 = 0.0954
+```
+
+对比：
+
+```text
+Stage1 HMDB16 baseline:                         best mAP@100 = 0.0994
+old warmup60 hard switch with Stage1 memory:    best mAP@100 = 0.1036
+legacy Stage1-no-memory warmup60 hard switch:   best mAP@100 = 0.0958
+AUCL v2 warm60 ramp20:                          best mAP@100 = 0.0983
+```
+
+结论：
+
+```text
+去掉 Phase I 的 L_memory_neighbor 明显削弱 warmup 表征。
+epoch 60 只有 0.0551，切到 AUCL v1 后能恢复到 0.0958，但仍低于 Stage1 baseline 和最好版本。
+当前证据支持：Stage1 warmup 中 L_memory_neighbor 不能去掉，它对构建可切换到 agentic refinement 的检索空间是关键项。
+```
