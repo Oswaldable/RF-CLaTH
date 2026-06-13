@@ -1691,3 +1691,53 @@ AUCL v2 warm60 ramp20:                          best mAP@100 = 0.0983
 epoch 60 只有 0.0551，切到 AUCL v1 后能恢复到 0.0958，但仍低于 Stage1 baseline 和最好版本。
 当前证据支持：Stage1 warmup 中 L_memory_neighbor 不能去掉，它对构建可切换到 agentic refinement 的检索空间是关键项。
 ```
+
+## 2026-06-13 HMDB16 Remaining-Fast Stage1 Launch
+
+目的：验证早期 slow/fast 分工设定，即 fast branch 只使用去掉关键帧后的 remaining frames，是否优于当前
+`input_frames=all` 的 HMDB16 Stage1 baseline。
+
+实验设置：
+
+```text
+dataset: HMDB51
+bits: 16
+gpu: cuda3
+objective: RFClathLoss / Stage1 original loss
+
+model.fast_encoder.input_frames = remaining
+
+loss:
+  0.30 L_view
++ 0.50 L_batch_neighbor
++ 0.04 L_memory_neighbor
++ 0.02 L_quant
++ 0.03 L_balance
+```
+
+对比目标：
+
+```text
+HMDB16 Stage1 all-frame fast baseline:
+  best mAP@100 = 0.0994
+  log: /mnt/disk2/yql/RF-CLaTH_run_logs/rf_clath_t_sas_hmdb_disk2_20260608_142724.queue.log
+```
+
+启动记录：
+
+| Dataset | Bit | Experiment | GPU | PID | Train Dir | Log | Status |
+|---|---:|---|---:|---:|---|---|---|
+| HMDB51 | 16 | T-SAS Stage1, fast input remaining frames | cuda3 | 3698325 | `/mnt/disk2/yql/RF-CLaTH_outputs/rf_clath_t_sas_hmdb_remaining_fast_disk2/hmdb_16b_20260613_072347` | `/mnt/disk2/yql/RF-CLaTH_outputs/rf_clath_t_sas_hmdb_remaining_fast_disk2/hmdb_16b_20260613_072347/train.log` | running |
+
+确认：
+
+```text
+saved config:
+  model.fast_encoder.input_frames: remaining
+
+launcher/nohup log:
+  /mnt/disk2/yql/RF-CLaTH_run_logs/rf_clath_hmdb16_remaining_fast_cuda3_20260613_072341.log
+
+note:
+  cuda3 already had substantial non-RF-CLaTH load at launch, so early progress may be slower than the previous HMDB16 baseline.
+```
