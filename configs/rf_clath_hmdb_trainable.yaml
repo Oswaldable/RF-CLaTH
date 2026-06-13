@@ -56,7 +56,7 @@ model:
 
   fast_encoder:
     type: bidirectional_mamba
-    input_frames: all
+    input_frames: remaining
     depth: 2
     d_state: 16
     d_conv: 4

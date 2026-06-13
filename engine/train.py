@@ -18,6 +18,8 @@ from losses import (
     HybridARFLoss,
     LegacyStage1ScheduledAgenticUnifiedLoss,
     LegacyStage1WarmupAgenticUnifiedLoss,
+    MemorySelfCalibratedRFClathLoss,
+    MergedSemanticRFClathLoss,
     PhasedAgenticUnifiedContrastiveLoss,
     RFClathLoss,
     Stage1ScheduledAgenticUnifiedLoss,
@@ -82,6 +84,10 @@ def build_criterion(cfg: Dict) -> nn.Module:
         return AgenticUnifiedContrastiveLoss(cfg)
     if objective in {"agentic_unified_contrastive_v2", "agentic_contrastive_v2", "aucl_v2"}:
         return AgenticUnifiedContrastiveLossV2(cfg)
+    if objective in {"memory_self_calibrated", "self_calibrated_memory", "memory_selfcal"}:
+        return MemorySelfCalibratedRFClathLoss(cfg)
+    if objective in {"merged_semantic", "semantic_merged", "merged_semantic_contrastive"}:
+        return MergedSemanticRFClathLoss(cfg)
     if objective in {
         "legacy_stage1_warmup_agentic_unified",
         "legacy_stage1_then_agentic_unified",
@@ -248,6 +254,7 @@ def train_one_epoch(
                 "agentic_hneg=%.1f agentic_pos_weight=%.3f mix_alpha=%.3f stage1_keep=%.3f "
                 "aucl_raw=%.4f aucl_mem_raw=%.4f aucl_mem_fb=%.4f aucl_beta=%.3f "
                 "aucl_pos_raw=%.1f aucl_pos_planned=%.1f aucl_pos_missed=%.1f aucl_hneg=%.1f "
+                "selfcal_trust=%.3f selfcal_obs=%.3f selfcal_posp=%.3f selfcal_negp=%.3f "
                 "agree=%.3f hamm=%.3f entropy=%.3f bit_use=%.3f sat=%.3f mask=%.3f fast_cos=%.3f",
                 epoch,
                 step,
@@ -293,6 +300,10 @@ def train_one_epoch(
                 float(losses.get("metric_aucl_pos_planned", torch.zeros((), device=device)).detach().cpu()),
                 float(losses.get("metric_aucl_pos_missed", torch.zeros((), device=device)).detach().cpu()),
                 float(losses.get("metric_aucl_hard_negative", torch.zeros((), device=device)).detach().cpu()),
+                float(losses.get("metric_selfcal_trust", torch.zeros((), device=device)).detach().cpu()),
+                float(losses.get("metric_selfcal_trust_observation", torch.zeros((), device=device)).detach().cpu()),
+                float(losses.get("metric_selfcal_pos_persistence", torch.zeros((), device=device)).detach().cpu()),
+                float(losses.get("metric_selfcal_neg_persistence", torch.zeros((), device=device)).detach().cpu()),
                 hash_metrics["metric_hash_agree"],
                 hash_metrics["metric_hamm_norm"],
                 hash_metrics["metric_bit_entropy"],
@@ -341,6 +352,7 @@ def train_one_epoch(
         "agentic_hneg=%.1f agentic_pos_weight=%.3f mix_alpha=%.3f stage1_keep=%.3f "
         "aucl_raw=%.4f aucl_mem_raw=%.4f aucl_mem_fb=%.4f aucl_beta=%.3f "
         "aucl_pos_raw=%.1f aucl_pos_planned=%.1f aucl_pos_missed=%.1f aucl_hneg=%.1f "
+        "selfcal_trust=%.3f selfcal_obs=%.3f selfcal_posp=%.3f selfcal_negp=%.3f "
         "agree=%.3f hamm=%.3f entropy=%.3f bit_use=%.3f balance_abs=%.3f sat=%.3f std=%.3f pos=%.3f mask=%.3f fast_cos=%.3f fused_cos=%.3f",
         epoch,
         time.time() - start,
@@ -385,6 +397,10 @@ def train_one_epoch(
         averaged.get("metric_aucl_pos_planned", 0.0),
         averaged.get("metric_aucl_pos_missed", 0.0),
         averaged.get("metric_aucl_hard_negative", 0.0),
+        averaged.get("metric_selfcal_trust", 0.0),
+        averaged.get("metric_selfcal_trust_observation", 0.0),
+        averaged.get("metric_selfcal_pos_persistence", 0.0),
+        averaged.get("metric_selfcal_neg_persistence", 0.0),
         averaged.get("metric_hash_agree", 0.0),
         averaged.get("metric_hamm_norm", 0.0),
         averaged.get("metric_bit_entropy", 0.0),

@@ -3,7 +3,12 @@ from typing import Dict, Iterable, Tuple
 import torch
 from torch import nn
 
-from .contrastive import HashContrastiveLoss, MemoryNeighborContrastiveLoss, NeighborHashContrastiveLoss
+from .contrastive import (
+    HashContrastiveLoss,
+    MemoryNeighborContrastiveLoss,
+    NeighborHashContrastiveLoss,
+    WeightedSemanticContrastiveLoss,
+)
 from .hash_losses import BalanceLoss, QuantizationLoss
 
 
@@ -163,4 +168,88 @@ class RFClathLoss(nn.Module):
             "loss_semantic": loss_semantic,
             "loss_hash": loss_hash,
             "loss": total,
+        }
+
+
+class MergedSemanticRFClathLoss(RFClathLoss):
+    """Ablation that merges paired-view and batch-neighbor supervision."""
+
+    def __init__(self, cfg: Dict):
+        super().__init__(cfg)
+        loss_cfg = cfg.get("loss", {})
+        semantic_cfg = loss_cfg.get("semantic", {})
+        temperature = float(loss_cfg.get("neighbor_temperature", loss_cfg.get("temperature", 0.2)))
+        self.lambda_merged_semantic = float(
+            semantic_cfg.get(
+                "lambda_merged",
+                semantic_cfg.get("lambda_semantic", self.lambda_view + self.lambda_batch_neighbor),
+            )
+        )
+        self.merged_semantic_contrast = WeightedSemanticContrastiveLoss(
+            temperature=temperature,
+            symmetric_neighbors=bool(loss_cfg.get("symmetric_neighbors", True)),
+            view_positive_weight=float(semantic_cfg.get("view_positive_weight", 0.6)),
+            neighbor_positive_weight=float(semantic_cfg.get("neighbor_positive_weight", 1.0)),
+            max_positive_weight=float(semantic_cfg.get("max_positive_weight", 2.0)),
+        )
+
+    def forward(self, outputs: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+        device = outputs["u_a"].device
+        zero = torch.zeros((), device=device)
+        components = {
+            "component_view_contrast": zero,
+            "component_batch_neighbor": zero,
+            "component_memory_neighbor": zero,
+            "component_quant": zero,
+            "component_bit_balance": zero,
+        }
+
+        if self.lambda_quant > 0:
+            components["component_quant"] = self.quantization(outputs["u_a"], outputs["u_b"])
+        if self.lambda_bit_balance > 0:
+            components["component_bit_balance"] = self.balance(outputs["u_a"], outputs["u_b"])
+
+        has_neighbors = "sample_indices" in outputs and "neighbor_indices" in outputs
+        component_merged_semantic = zero
+        if self.lambda_merged_semantic > 0 and has_neighbors:
+            component_merged_semantic = self.merged_semantic_contrast(
+                outputs["u_a"],
+                outputs["u_b"],
+                outputs["sample_indices"],
+                outputs["neighbor_indices"],
+            )
+            components["component_batch_neighbor"] = component_merged_semantic
+            if self.lambda_view > 0:
+                components["component_view_contrast"] = self.hash_contrast(outputs["u_a"], outputs["u_b"])
+
+        current_epoch = self._current_epoch(outputs)
+        if self.lambda_memory_neighbor > 0 and current_epoch >= self.memory_neighbor_start_epoch and has_neighbors:
+            components["component_memory_neighbor"] = self.memory_neighbor_contrast(
+                outputs["u_a"],
+                outputs["u_b"],
+                outputs["sample_indices"],
+                outputs["neighbor_indices"],
+            )
+
+        loss_view = zero
+        loss_semantic = (
+            self.lambda_merged_semantic * component_merged_semantic
+            + self.lambda_memory_neighbor * components["component_memory_neighbor"]
+        )
+        loss_hash = (
+            self.lambda_quant * components["component_quant"]
+            + self.lambda_bit_balance * components["component_bit_balance"]
+        )
+        total = loss_view + loss_semantic + loss_hash
+
+        return {
+            **components,
+            "component_merged_semantic": component_merged_semantic,
+            "loss_view": loss_view,
+            "loss_semantic": loss_semantic,
+            "loss_hash": loss_hash,
+            "loss": total,
+            "metric_agentic_raw": component_merged_semantic.detach(),
+            "metric_agentic_pos_view": outputs["u_a"].new_tensor(1.0),
+            "metric_agentic_pos_batch": outputs["u_a"].new_tensor(1.0),
         }

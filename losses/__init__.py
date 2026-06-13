@@ -6,12 +6,13 @@ from .arf_loss import (
     HybridARFLoss,
     LegacyStage1ScheduledAgenticUnifiedLoss,
     LegacyStage1WarmupAgenticUnifiedLoss,
+    MemorySelfCalibratedRFClathLoss,
     PhasedAgenticUnifiedContrastiveLoss,
     Stage1ScheduledAgenticUnifiedLoss,
     Stage1WarmupAgenticUnifiedLoss,
     StaticARFLoss,
 )
-from .total_loss import RFClathLoss
+from .total_loss import MergedSemanticRFClathLoss, RFClathLoss
 
 __all__ = [
     "RFClathLoss",
@@ -23,6 +24,8 @@ __all__ = [
     "AgenticUnifiedContrastiveLossV2",
     "LegacyStage1ScheduledAgenticUnifiedLoss",
     "LegacyStage1WarmupAgenticUnifiedLoss",
+    "MemorySelfCalibratedRFClathLoss",
+    "MergedSemanticRFClathLoss",
     "PhasedAgenticUnifiedContrastiveLoss",
     "Stage1ScheduledAgenticUnifiedLoss",
     "Stage1WarmupAgenticUnifiedLoss",
