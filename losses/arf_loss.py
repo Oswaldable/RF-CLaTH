@@ -14,6 +14,7 @@ from .contrastive import (
     HashContrastiveLoss,
     NeighborHashContrastiveLoss,
     SelfCalibratedMemoryNeighborContrastiveLoss,
+    WeightedSemanticContrastiveLoss,
 )
 from .hash_losses import BalanceLoss, QuantizationLoss
 from .total_loss import RFClathLoss
@@ -1122,6 +1123,175 @@ class MemorySelfCalibratedRFClathLoss(ContrastiveARFLoss):
             "loss_hash": loss_hash,
             "loss": total,
             "metric_agentic_raw": component_memory.detach(),
+            "metric_agentic_pos_memory": memory_metrics["pos_raw_count"],
+            "metric_agentic_pos_arf": memory_metrics["pos_planned_count"],
+            "metric_agentic_hard_positive_count": memory_metrics["pos_missed_count"],
+            "metric_agentic_hard_negative_count": memory_metrics["hard_negative_count"],
+            "metric_agentic_positive_weight_mean": memory_metrics["positive_weight_mean"],
+            "metric_agentic_mix_alpha": torch.tensor(float(1.0 if trace_enabled else 0.0), device=device),
+            "metric_stage1_keep_weight": torch.tensor(float(0.0 if trace_enabled else 1.0), device=device),
+            "metric_aucl_raw": component_memory.detach(),
+            "metric_aucl_memory_raw": memory_metrics["memory_raw"].detach(),
+            "metric_aucl_memory_feedback": component_memory.detach(),
+            "metric_aucl_beta": memory_metrics["trust_mean"],
+            "metric_aucl_pos_raw": memory_metrics["pos_raw_count"],
+            "metric_aucl_pos_planned": memory_metrics["pos_planned_count"],
+            "metric_aucl_pos_missed": memory_metrics["pos_missed_count"],
+            "metric_aucl_hard_negative": memory_metrics["hard_negative_count"],
+            "metric_arf_target_count": memory_metrics["pos_planned_count"],
+            "metric_arf_target_mean": avg_target_metric("metric_retrieved_target_mean"),
+            "metric_arf_hard_positive_count": memory_metrics["pos_missed_count"],
+            "metric_arf_hard_negative_count": memory_metrics["hard_negative_count"],
+            "metric_arf_actual_overlap": avg_target_metric("metric_actual_overlap"),
+            "metric_arf_false_ratio": avg_target_metric("metric_false_ratio"),
+            "metric_arf_missed_ratio": avg_target_metric("metric_missed_ratio"),
+            "metric_arf_retrieved_target_mean": avg_target_metric("metric_retrieved_target_mean"),
+            "metric_arf_feedback_weight_mean": memory_metrics["positive_weight_mean"],
+            "metric_arf_eta_missed": torch.tensor(float(schedule["eta_missed"]), device=device),
+            "metric_arf_eta_false": torch.tensor(float(schedule["eta_false"]), device=device),
+            "metric_arf_omega_z": torch.tensor(float(schedule["omega_z"]), device=device),
+            "metric_arf_gamma": torch.tensor(float(schedule["gamma"]), device=device),
+            "metric_selfcal_trust": memory_metrics["trust_mean"],
+            "metric_selfcal_trust_active": memory_metrics["trust_active"],
+            "metric_selfcal_trust_observation": memory_metrics["trust_observation"],
+            "metric_selfcal_pos_persistence": memory_metrics["positive_persistence_mean"],
+            "metric_selfcal_neg_persistence": memory_metrics["negative_persistence_mean"],
+        }
+
+
+class MergedSemanticSelfCalibratedRFClathLoss(MemorySelfCalibratedRFClathLoss):
+    """Merged semantic objective with agentic feedback limited to memory loss."""
+
+    requires_planner_memory = True
+
+    def __init__(self, cfg: Dict):
+        super().__init__(cfg)
+        loss_cfg = cfg.get("loss", {})
+        semantic_cfg = loss_cfg.get("semantic", {})
+        temperature = float(loss_cfg.get("neighbor_temperature", loss_cfg.get("temperature", 0.2)))
+        self.lambda_merged_semantic = float(
+            semantic_cfg.get(
+                "lambda_merged",
+                semantic_cfg.get("lambda_semantic", self.lambda_view + self.lambda_batch_neighbor),
+            )
+        )
+        self.merged_semantic_contrast = WeightedSemanticContrastiveLoss(
+            temperature=temperature,
+            symmetric_neighbors=bool(loss_cfg.get("symmetric_neighbors", True)),
+            view_positive_weight=float(semantic_cfg.get("view_positive_weight", 1.2)),
+            neighbor_positive_weight=float(semantic_cfg.get("neighbor_positive_weight", 1.0)),
+            max_positive_weight=float(semantic_cfg.get("max_positive_weight", 2.0)),
+        )
+
+    def _empty_trace_targets(self, sample_indices: torch.Tensor, device: torch.device) -> Dict[str, torch.Tensor]:
+        batch_size = sample_indices.shape[0]
+        empty_idx = torch.empty(batch_size, 0, dtype=torch.long, device=device)
+        empty_val = torch.empty(batch_size, 0, dtype=torch.float32, device=device)
+        empty_mask = torch.empty(batch_size, 0, dtype=torch.bool, device=device)
+        zero = torch.zeros((), device=device)
+        return {
+            "target_indices": empty_idx,
+            "target_scores": empty_val,
+            "target_mask": empty_mask,
+            "target_weights": empty_val,
+            "planned_indices": empty_idx,
+            "actual_indices": empty_idx,
+            "metric_actual_overlap": zero,
+            "metric_false_ratio": zero,
+            "metric_missed_ratio": zero,
+            "metric_retrieved_target_mean": zero,
+            "metric_feedback_weight_mean": zero,
+        }
+
+    def forward(self, outputs: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+        device = outputs["u_a"].device
+        zero = torch.zeros((), device=device)
+        memory = outputs.get("planner_memory", None)
+        planner = outputs.get("graph_planner", None)
+        sample_indices = outputs.get("sample_indices", None)
+        neighbor_indices = outputs.get("neighbor_indices", None)
+        if memory is None or planner is None or sample_indices is None or neighbor_indices is None:
+            raise ValueError(
+                "MergedSemanticSelfCalibratedRFClathLoss requires planner_memory, "
+                "graph_planner, sample_indices, and neighbor_indices."
+            )
+
+        epoch_tensor = outputs.get("epoch", torch.ones((), device=device))
+        epoch = int(epoch_tensor.detach().cpu().item()) if torch.is_tensor(epoch_tensor) else int(epoch_tensor)
+        schedule = dict(self._schedule(epoch))
+        trace_enabled = epoch >= self.actual_trace_start_epoch
+        if not trace_enabled:
+            schedule["use_actual_trace"] = False
+            schedule["eta_missed"] = 0.0
+            schedule["eta_false"] = 0.0
+            targets_a = self._empty_trace_targets(sample_indices, device)
+            targets_b = self._empty_trace_targets(sample_indices, device)
+        else:
+            schedule["use_actual_trace"] = True
+            targets_a = self._trace_targets_for_view(outputs, "u_a", memory, planner, sample_indices, schedule)
+            targets_b = self._trace_targets_for_view(outputs, "u_b", memory, planner, sample_indices, schedule)
+        hard_mining_enabled = trace_enabled and epoch >= self.hard_mining_start_epoch
+
+        component_merged_semantic = zero
+        component_view = zero
+        if self.lambda_merged_semantic > 0:
+            component_merged_semantic = self.merged_semantic_contrast(
+                outputs["u_a"],
+                outputs["u_b"],
+                sample_indices,
+                neighbor_indices,
+            )
+            if self.lambda_view > 0:
+                component_view = self.hash_contrast(outputs["u_a"], outputs["u_b"])
+
+        if self.lambda_memory_self_calibrated > 0 and epoch >= self.memory_self_calibrated_start_epoch:
+            memory_metrics = self.self_calibrated_memory.forward_self_calibrated(
+                outputs["u_a"],
+                outputs["u_b"],
+                sample_indices,
+                neighbor_indices,
+                targets_a,
+                targets_b,
+                trace_enabled=trace_enabled,
+                hard_mining_enabled=hard_mining_enabled,
+            )
+        else:
+            memory_metrics = self.self_calibrated_memory._zero_result(outputs["u_a"])
+        component_memory = memory_metrics["memory_self_calibrated"]
+
+        component_quant = self.quantization(outputs["u_a"], outputs["u_b"])
+        component_bit_balance = self.balance(outputs["u_a"], outputs["u_b"])
+
+        loss_semantic = self.lambda_merged_semantic * component_merged_semantic
+        loss_semantic = loss_semantic + self.lambda_memory_self_calibrated * component_memory
+        loss_hash = (
+            float(schedule["lambda_quant"]) * component_quant
+            + float(schedule["lambda_balance"]) * component_bit_balance
+        )
+        total = loss_semantic + loss_hash
+
+        def avg_target_metric(key: str) -> torch.Tensor:
+            a = targets_a[key].to(device) if torch.is_tensor(targets_a[key]) else torch.tensor(targets_a[key], device=device)
+            b = targets_b[key].to(device) if torch.is_tensor(targets_b[key]) else torch.tensor(targets_b[key], device=device)
+            return 0.5 * (a.float() + b.float())
+
+        return {
+            "component_view_contrast": component_view,
+            "component_batch_neighbor": component_merged_semantic,
+            "component_memory_neighbor": component_memory,
+            "component_merged_semantic": component_merged_semantic,
+            "component_arf_static": zero,
+            "component_arf_contrastive": zero,
+            "component_quant": component_quant,
+            "component_bit_balance": component_bit_balance,
+            "loss_view": zero,
+            "loss_semantic": loss_semantic,
+            "loss_arf": zero,
+            "loss_hash": loss_hash,
+            "loss": total,
+            "metric_agentic_raw": component_memory.detach(),
+            "metric_agentic_pos_view": torch.ones((), device=device),
+            "metric_agentic_pos_batch": torch.ones((), device=device),
             "metric_agentic_pos_memory": memory_metrics["pos_raw_count"],
             "metric_agentic_pos_arf": memory_metrics["pos_planned_count"],
             "metric_agentic_hard_positive_count": memory_metrics["pos_missed_count"],

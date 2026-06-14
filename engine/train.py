@@ -19,6 +19,7 @@ from losses import (
     LegacyStage1ScheduledAgenticUnifiedLoss,
     LegacyStage1WarmupAgenticUnifiedLoss,
     MemorySelfCalibratedRFClathLoss,
+    MergedSemanticSelfCalibratedRFClathLoss,
     MergedSemanticRFClathLoss,
     PhasedAgenticUnifiedContrastiveLoss,
     RFClathLoss,
@@ -86,6 +87,12 @@ def build_criterion(cfg: Dict) -> nn.Module:
         return AgenticUnifiedContrastiveLossV2(cfg)
     if objective in {"memory_self_calibrated", "self_calibrated_memory", "memory_selfcal"}:
         return MemorySelfCalibratedRFClathLoss(cfg)
+    if objective in {
+        "merged_semantic_self_calibrated",
+        "merged_self_calibrated",
+        "merged_semantic_memory_selfcal",
+    }:
+        return MergedSemanticSelfCalibratedRFClathLoss(cfg)
     if objective in {"merged_semantic", "semantic_merged", "merged_semantic_contrastive"}:
         return MergedSemanticRFClathLoss(cfg)
     if objective in {
