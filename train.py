@@ -20,7 +20,14 @@ def build_argparser():
     parser.add_argument("--config", default=str(PROJECT_ROOT / "configs/default.yaml"))
     parser.add_argument(
         "--dataset",
-        choices=["activitynet", "fcvid", "hmdb", "s5vh_activitynet", "s5vh_fcv", "s5vh_hmdb", "s5vh_ucf"],
+        choices=[
+            "act",
+            "activitynet",
+            "fcv",
+            "fcvid",
+            "hmdb",
+            "ucf",
+        ],
         default=None,
     )
     parser.add_argument("--device", default=None)

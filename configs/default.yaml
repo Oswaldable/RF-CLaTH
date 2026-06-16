@@ -4,24 +4,24 @@ project:
   seed: 3346
 
 data:
-  name: s5vh_ucf
+  name: ucf
   cache_in_memory: false
   num_workers: 8
   pin_memory: true
   datasets:
-    s5vh_ucf:
-      dataset: s5vh_ucf
-      format: s5vh_h5
+    ucf:
+      dataset: ucf
+      format: repartition_h5
       num_classes: 101
       feature_key: feats
       train_feature_path: /mnt/disk2/yql/dataset_rePartition/ucf/ucf_train_feats.h5
       val_feature_path: /mnt/disk2/yql/dataset_rePartition/ucf/ucf_test_feats.h5
       test_feature_path: /mnt/disk2/yql/dataset_rePartition/ucf/ucf_test_feats.h5
       retrieval_feature_path: /mnt/disk2/yql/dataset_rePartition/ucf/ucf_train_feats.h5
-      train_label_path: ./cache/repartition_s5vh_ucf_train_label.pt
-      val_label_path: ./cache/repartition_s5vh_ucf_q_label.pt
-      test_label_path: ./cache/repartition_s5vh_ucf_q_label.pt
-      retrieval_label_path: ./cache/repartition_s5vh_ucf_re_label.pt
+      train_label_path: ./cache/repartition_ucf_train_label.pt
+      val_label_path: ./cache/repartition_ucf_q_label.pt
+      test_label_path: ./cache/repartition_ucf_q_label.pt
+      retrieval_label_path: ./cache/repartition_ucf_re_label.pt
 
 model:
   input_type: features
@@ -127,7 +127,7 @@ neighbor:
   sim_chunk_size: 512
   build_on_cuda: true
   cache: true
-  cache_path: ./cache/repartition_s5vh_ucf_train_rawmean_top20.pt
+  cache_path: ./cache/repartition_ucf_train_rawmean_top20.pt
   label_precision_probe: 0
 
 train:

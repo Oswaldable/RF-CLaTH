@@ -11,17 +11,17 @@ data:
   datasets:
     hmdb:
       dataset: hmdb
-      format: s5vh_h5
+      format: repartition_h5
       num_classes: 51
       feature_key: feats
       train_feature_path: /mnt/disk2/yql/dataset_rePartition/hmdb/hmdb_train_feats.h5
       val_feature_path: /mnt/disk2/yql/dataset_rePartition/hmdb/hmdb_test_feats.h5
       test_feature_path: /mnt/disk2/yql/dataset_rePartition/hmdb/hmdb_test_feats.h5
       retrieval_feature_path: /mnt/disk2/yql/dataset_rePartition/hmdb/hmdb_train_feats.h5
-      train_label_path: ./cache/repartition_s5vh_hmdb_train_label.pt
-      val_label_path: ./cache/repartition_s5vh_hmdb_q_label.pt
-      test_label_path: ./cache/repartition_s5vh_hmdb_q_label.pt
-      retrieval_label_path: ./cache/repartition_s5vh_hmdb_re_label.pt
+      train_label_path: ./cache/repartition_hmdb_train_label.pt
+      val_label_path: ./cache/repartition_hmdb_q_label.pt
+      test_label_path: ./cache/repartition_hmdb_q_label.pt
+      retrieval_label_path: ./cache/repartition_hmdb_re_label.pt
 
 model:
   input_type: features

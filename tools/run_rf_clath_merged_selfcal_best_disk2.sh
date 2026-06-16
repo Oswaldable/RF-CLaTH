@@ -32,21 +32,21 @@ case "$DATASET_KEY" in
     TAG=hmdb
     PROJECT_DATASET=HMDB
     ;;
-  ucf|s5vh_ucf)
+  ucf)
     CONFIG=configs/rf_clath_ucf.yaml
-    DATASET_ARG=s5vh_ucf
+    DATASET_ARG=ucf
     TAG=ucf
     PROJECT_DATASET=UCF
     ;;
-  act|activitynet|s5vh_activitynet)
+  act|activitynet)
     CONFIG=configs/rf_clath_activitynet.yaml
-    DATASET_ARG=s5vh_activitynet
+    DATASET_ARG=activitynet
     TAG=activitynet
     PROJECT_DATASET=ActivityNet
     ;;
-  fcv|fcvid|s5vh_fcv)
+  fcv|fcvid)
     CONFIG=configs/rf_clath_fcv.yaml
-    DATASET_ARG=s5vh_fcv
+    DATASET_ARG=fcv
     TAG=fcv
     PROJECT_DATASET=FCVID
     ;;

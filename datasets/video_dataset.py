@@ -363,6 +363,12 @@ class S5VHFeatureDataset(Dataset):
 def select_dataset_config(cfg: Dict, dataset_name: Optional[str] = None) -> Dict:
     data_cfg = cfg["data"]
     dataset_name = dataset_name or data_cfg.get("name", "fcvid")
+    aliases = {
+        "act": "activitynet",
+        "fcvid": "fcv",
+    }
+    if dataset_name not in data_cfg["datasets"]:
+        dataset_name = aliases.get(dataset_name, dataset_name)
     selected = dict(data_cfg["datasets"][dataset_name])
     selected["cache_in_memory"] = data_cfg.get("cache_in_memory", False)
     return selected
@@ -381,7 +387,7 @@ def build_dataloader(
     data_cfg = cfg.get("data", {})
     selected = select_dataset_config(cfg, dataset_name=dataset_name)
     dataset_format = selected.get("format", "avhash")
-    dataset_cls = S5VHFeatureDataset if dataset_format == "s5vh_h5" else AVHashFeatureDataset
+    dataset_cls = S5VHFeatureDataset if dataset_format in {"s5vh_h5", "repartition_h5"} else AVHashFeatureDataset
     dataset = dataset_cls(
         selected,
         split=split,
