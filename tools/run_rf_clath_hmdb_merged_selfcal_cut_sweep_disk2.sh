@@ -11,10 +11,22 @@ BITS="${BITS:-16}"
 EPOCHS="${EPOCHS:-70}"
 CUTS="${CUTS:-20 25 30 35}"
 OMEGA_Z="${OMEGA_Z:-0.30}"
+RUN_SUFFIX="${RUN_SUFFIX:-omegaz_sweep_remaining_fast_disk2}"
+LAMBDA_MERGED="${LAMBDA_MERGED:-0.8}"
+VIEW_POSITIVE_WEIGHT="${VIEW_POSITIVE_WEIGHT:-1.2}"
+NEIGHBOR_POSITIVE_WEIGHT="${NEIGHBOR_POSITIVE_WEIGHT:-1.0}"
+MAX_POSITIVE_WEIGHT="${MAX_POSITIVE_WEIGHT:-2.0}"
+LAMBDA_MEMORY_NEIGHBOR="${LAMBDA_MEMORY_NEIGHBOR:-0.04}"
+MEMORY_POSITIVES_PER_ANCHOR="${MEMORY_POSITIVES_PER_ANCHOR:-15}"
+NEIGHBOR_TEMPERATURE="${NEIGHBOR_TEMPERATURE:-0.2}"
+MEMORY_TEMPERATURE="${MEMORY_TEMPERATURE:-0.2}"
+TOP_R="${TOP_R:-20}"
+FEEDBACK_RAMP_EPOCHS="${FEEDBACK_RAMP_EPOCHS:-1}"
+RAW_TRUST_TOPK="${RAW_TRUST_TOPK:-20}"
 
 CONFIG=configs/rf_clath_hmdb.yaml
 DATASET=hmdb
-OUTPUT_DIR="${OUTPUT_ROOT}/rf_clath_hmdb_merged_selfcal_omegaz_sweep_remaining_fast_disk2"
+OUTPUT_DIR="${OUTPUT_ROOT}/rf_clath_hmdb_merged_selfcal_${RUN_SUFFIX}"
 
 mkdir -p "$OUTPUT_ROOT" "$LOG_ROOT"
 
@@ -31,7 +43,7 @@ run_hmdb() {
       warmup=0
     fi
     for bits in $BITS; do
-      echo "$(timestamp) | merged_selfcal_omegaz cut=${cut} ${bits}-bit start on cuda${GPU}"
+      echo "$(timestamp) | merged_selfcal_omegaz cut=${cut} ${bits}-bit start on cuda${GPU}, view=${VIEW_POSITIVE_WEIGHT}, temp=${NEIGHBOR_TEMPERATURE}, mem_pos=${MEMORY_POSITIVES_PER_ANCHOR}, raw_trust_topk=${RAW_TRUST_TOPK}, suffix=${RUN_SUFFIX}"
       CUDA_VISIBLE_DEVICES="$GPU" PYTHONPATH="$PROJECT_ROOT" "$PYTHON_BIN" train.py \
         --config "$CONFIG" \
         --dataset "$DATASET" \
@@ -39,18 +51,19 @@ run_hmdb() {
         --output-dir "$OUTPUT_DIR/cut${cut}" \
         --epochs "$EPOCHS" \
         --hash-bits "$bits" \
-        --override "project.name=RF-CLaTH-HMDB-MergedSelfCal-OmegaZ-Cut${cut}" \
+        --override "project.name=RF-CLaTH-HMDB-MergedSelfCal-${RUN_SUFFIX}-Cut${cut}" \
         --override "training.objective=merged_semantic_self_calibrated" \
         --override "train.objective=merged_semantic_self_calibrated" \
         --override "loss.type=merged_semantic_self_calibrated" \
         --override "model.fast_encoder.input_frames=remaining" \
-        --override "loss.semantic.lambda_merged=0.8" \
-        --override "loss.semantic.view_positive_weight=1.2" \
-        --override "loss.semantic.neighbor_positive_weight=1.0" \
-        --override "loss.semantic.max_positive_weight=2.0" \
-        --override "loss.semantic.lambda_memory_neighbor=0.04" \
-        --override "loss.neighbor_temperature=0.2" \
-        --override "loss.memory_neighbor.temperature=0.2" \
+        --override "loss.semantic.lambda_merged=${LAMBDA_MERGED}" \
+        --override "loss.semantic.view_positive_weight=${VIEW_POSITIVE_WEIGHT}" \
+        --override "loss.semantic.neighbor_positive_weight=${NEIGHBOR_POSITIVE_WEIGHT}" \
+        --override "loss.semantic.max_positive_weight=${MAX_POSITIVE_WEIGHT}" \
+        --override "loss.semantic.lambda_memory_neighbor=${LAMBDA_MEMORY_NEIGHBOR}" \
+        --override "loss.memory_neighbor.positives_per_anchor=${MEMORY_POSITIVES_PER_ANCHOR}" \
+        --override "loss.neighbor_temperature=${NEIGHBOR_TEMPERATURE}" \
+        --override "loss.memory_neighbor.temperature=${MEMORY_TEMPERATURE}" \
         --override "planner.omega_s=0.45" \
         --override "planner.omega_t=0.25" \
         --override "planner.omega_z=${OMEGA_Z}" \
@@ -59,14 +72,15 @@ run_hmdb() {
         --override "planner.warmup.omega_t=0.35" \
         --override "planner.warmup.omega_z=0.0" \
         --override "retrieval_environment.use_actual_trace=true" \
-        --override "retrieval_environment.top_r=20" \
+        --override "retrieval_environment.top_r=${TOP_R}" \
         --override "feedback.eta_missed_start=0.0" \
         --override "feedback.eta_false_start=0.0" \
         --override "feedback.eta_missed_final=1.0" \
         --override "feedback.eta_false_final=1.0" \
-        --override "feedback.ramp_epochs=1" \
+        --override "feedback.ramp_epochs=${FEEDBACK_RAMP_EPOCHS}" \
         --override "memory_self_calibrated.actual_trace_start_epoch=${cut}" \
         --override "memory_self_calibrated.hard_mining_start_epoch=${cut}" \
+        --override "memory_self_calibrated.raw_trust_topk=${RAW_TRUST_TOPK}" \
         --override "train.eval_interval=5" \
         --override "train.save_interval=5"
     done
@@ -75,7 +89,7 @@ run_hmdb() {
   echo "$(timestamp) | merged_selfcal_omegaz sweep done"
 }
 
-log_file="${LOG_ROOT}/rf_clath_hmdb_merged_selfcal_omegaz_sweep_cuda${GPU}_$(date +%Y%m%d_%H%M%S).queue.log"
-echo "$(timestamp) | RF-CLaTH HMDB merged-selfcal omega_z sweep start, cuts=${CUTS}, bits=${BITS}, gpu=${GPU}, log=${log_file}"
+log_file="${LOG_ROOT}/rf_clath_hmdb_merged_selfcal_${RUN_SUFFIX}_cuda${GPU}_$(date +%Y%m%d_%H%M%S).queue.log"
+echo "$(timestamp) | RF-CLaTH HMDB merged-selfcal omega_z sweep start, cuts=${CUTS}, bits=${BITS}, gpu=${GPU}, view=${VIEW_POSITIVE_WEIGHT}, temp=${NEIGHBOR_TEMPERATURE}, mem_pos=${MEMORY_POSITIVES_PER_ANCHOR}, raw_trust_topk=${RAW_TRUST_TOPK}, suffix=${RUN_SUFFIX}, log=${log_file}"
 run_hmdb >> "$log_file" 2>&1
 echo "$(timestamp) | RF-CLaTH HMDB merged-selfcal omega_z sweep done"
