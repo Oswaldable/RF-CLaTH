@@ -40,9 +40,17 @@ from utils.neighbor import NeighborBatchSampler, estimate_neighbor_label_precisi
 from utils.seed import set_seed
 
 
-def build_optimizer(model: nn.Module, criterion: nn.Module, cfg: Dict):
+def build_optimizer(
+    model: nn.Module,
+    criterion: nn.Module,
+    cfg: Dict,
+    agent_controller: Optional[AgenticTrainingController] = None,
+):
     train_cfg = cfg.get("train", {})
     params = list(model.parameters()) + list(criterion.parameters())
+    if agent_controller is not None:
+        params += list(agent_controller.parameters())
+    params = [param for param in params if param.requires_grad]
     if train_cfg.get("optimizer", "adamw").lower() != "adamw":
         raise ValueError("Only AdamW is implemented.")
     return torch.optim.AdamW(
@@ -181,6 +189,8 @@ def train_one_epoch(
 ) -> Dict[str, float]:
     model.train()
     criterion.train()
+    if agent_controller is not None:
+        agent_controller.train()
     if hasattr(getattr(dataloader, "batch_sampler", None), "set_epoch"):
         dataloader.batch_sampler.set_epoch(epoch)
     train_cfg = cfg.get("train", {})
@@ -229,7 +239,10 @@ def train_one_epoch(
         scaler.scale(loss).backward()
         if grad_clip > 0:
             scaler.unscale_(optimizer)
-            nn.utils.clip_grad_norm_(list(model.parameters()) + list(criterion.parameters()), grad_clip)
+            clip_params = list(model.parameters()) + list(criterion.parameters())
+            if agent_controller is not None:
+                clip_params += list(agent_controller.parameters())
+            nn.utils.clip_grad_norm_([param for param in clip_params if param.requires_grad], grad_clip)
         scaler.step(optimizer)
         scaler.update()
 
@@ -654,24 +667,33 @@ def train_rf_clath(
             planner_device,
             labels is not None,
         )
-    agent_controller = AgenticTrainingController(cfg)
+    agent_controller = AgenticTrainingController(cfg).to(use_device)
     if agent_controller.enabled:
         logger.info(
-            "agentic_controller enabled routed_similarity=%s sample_weight=%s feedback_graph=%s stop_policy=%s",
+            "agentic_controller enabled routed_similarity=%s sample_weight=%s feedback_graph=%s stop_policy=%s learnable_policy=%s",
             agent_controller.use_routed_similarity,
             agent_controller.sample_weight_enabled,
             agent_controller.update_feedback_graph,
             agent_controller.stop_enabled,
+            agent_controller.learnable_policy,
         )
     save_config(cfg, str(output_dir / "config.yaml"))
-    optimizer = build_optimizer(model, criterion, cfg)
+    optimizer = build_optimizer(model, criterion, cfg, agent_controller=agent_controller)
     scheduler = build_scheduler(optimizer, cfg)
 
     start_epoch = 1
     best_map = 0.0
     resume = cfg.get("train", {}).get("resume", "")
     if resume:
-        state = load_checkpoint(resume, model, optimizer, scheduler, criterion, map_location=str(use_device))
+        state = load_checkpoint(
+            resume,
+            model,
+            optimizer,
+            scheduler,
+            criterion,
+            agent_controller=agent_controller,
+            map_location=str(use_device),
+        )
         start_epoch = int(state.get("epoch", 0)) + 1
         best_map = float(state.get("best_metric", 0.0))
         if state.get("_optimizer_loaded") is False:
@@ -733,6 +755,7 @@ def train_rf_clath(
                 optimizer,
                 scheduler,
                 criterion,
+                agent_controller=agent_controller,
                 epoch=epoch,
                 best_metric=best_map,
                 cfg=cfg,
@@ -760,6 +783,7 @@ def train_rf_clath(
                     optimizer,
                     scheduler,
                     criterion,
+                    agent_controller=agent_controller,
                     epoch=epoch,
                     best_metric=best_map,
                     cfg=cfg,
@@ -793,6 +817,7 @@ def train_rf_clath(
         optimizer,
         scheduler,
         criterion,
+        agent_controller=agent_controller,
         epoch=last_epoch,
         best_metric=best_map,
         cfg=cfg,

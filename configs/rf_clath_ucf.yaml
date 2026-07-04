@@ -145,11 +145,20 @@ agentic_contrastive:
     arf_planned: 0.25
     arf_missed_bonus: 0.25
   hard_negative_weight: 1.25
+  route_loss:
+    lambda: 0.005
+    min_trust: 0.05
+    collapse_only: false
+    entropy_low: 0.05
+    entropy_high: 0.98
 
 agentic:
   enabled: true
   log_style: agent
   policy:
+    learnable: true
+    hidden_dim: 32
+    dropout: 0.0
     route_enabled: true
     use_routed_similarity: true
     use_subcode_concat: true

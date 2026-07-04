@@ -78,6 +78,7 @@ def save_checkpoint(
     optimizer=None,
     scheduler=None,
     criterion=None,
+    agent_controller=None,
     epoch: int = 0,
     best_metric: float = 0.0,
     cfg: dict = None,
@@ -95,6 +96,8 @@ def save_checkpoint(
         state["scheduler"] = scheduler.state_dict()
     if criterion is not None:
         state["criterion"] = criterion.state_dict()
+    if agent_controller is not None:
+        state["agent_controller"] = agent_controller.state_dict()
     torch.save(state, path)
 
 
@@ -104,6 +107,7 @@ def load_checkpoint(
     optimizer=None,
     scheduler=None,
     criterion=None,
+    agent_controller=None,
     map_location: Optional[str] = None,
 ):
     state = torch.load(path, map_location=map_location or "cpu")
@@ -152,4 +156,6 @@ def load_checkpoint(
                 )
     if criterion is not None and "criterion" in state:
         criterion.load_state_dict(state["criterion"], strict=False)
+    if agent_controller is not None and "agent_controller" in state:
+        agent_controller.load_state_dict(state["agent_controller"], strict=False)
     return state

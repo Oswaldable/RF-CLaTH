@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import Dict, Optional
 
 import torch
+from torch import nn
 
 
 def _nested(cfg: Dict, path: tuple[str, ...], default=None):
@@ -39,7 +40,44 @@ def _tensor_stats(values: torch.Tensor) -> tuple[float, float]:
     return mean, std
 
 
-class AgenticTrainingController:
+class AgenticPolicyMLP(nn.Module):
+    """Small learnable policy for route alpha and sample omega.
+
+    The policy consumes compact numeric observations from the planner, memory,
+    and branch representations. Heads are zero-initialized so training starts
+    from the deterministic controller behavior and learns residual corrections.
+    """
+
+    def __init__(self, input_dim: int, hidden_dim: int = 32, dropout: float = 0.0):
+        super().__init__()
+        hidden_dim = max(4, int(hidden_dim))
+        layers = [
+            nn.LayerNorm(int(input_dim)),
+            nn.Linear(int(input_dim), hidden_dim),
+            nn.SiLU(),
+        ]
+        if dropout > 0:
+            layers.append(nn.Dropout(float(dropout)))
+        layers.extend(
+            [
+                nn.Linear(hidden_dim, hidden_dim),
+                nn.SiLU(),
+            ]
+        )
+        self.trunk = nn.Sequential(*layers)
+        self.alpha_head = nn.Linear(hidden_dim, 1)
+        self.omega_head = nn.Linear(hidden_dim, 1)
+        nn.init.zeros_(self.alpha_head.weight)
+        nn.init.zeros_(self.alpha_head.bias)
+        nn.init.zeros_(self.omega_head.weight)
+        nn.init.zeros_(self.omega_head.bias)
+
+    def forward(self, state: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        h = self.trunk(state.float())
+        return self.alpha_head(h).squeeze(-1), self.omega_head(h).squeeze(-1)
+
+
+class AgenticTrainingController(nn.Module):
     """Outer-loop controller for agentic retrieval training.
 
     The controller is intentionally lightweight: it does not replace the inner
@@ -48,7 +86,10 @@ class AgenticTrainingController:
     slow/fast routing alpha, sample contribution omega, and retrieval budget.
     """
 
+    policy_input_dim = 14
+
     def __init__(self, cfg: Dict):
+        super().__init__()
         self.cfg = cfg.get("agentic", {})
         self.enabled = bool(self.cfg.get("enabled", False))
         self.log_style = str(self.cfg.get("log_style", "agent")).lower()
@@ -73,6 +114,10 @@ class AgenticTrainingController:
         self.omega_min = float(policy_cfg.get("omega_min", 0.5))
         self.omega_max = float(policy_cfg.get("omega_max", 1.5))
         self.omega_scale = float(policy_cfg.get("omega_scale", 0.5))
+        self.learnable_policy = bool(policy_cfg.get("learnable", policy_cfg.get("learnable_policy", False)))
+        self.policy_omega_delta = float(policy_cfg.get("learned_omega_delta", 0.25))
+        self.route_target_kappa = float(policy_cfg.get("route_target_kappa", self.alpha_kappa))
+        self.total_epochs = max(1, int(cfg.get("train", {}).get("epochs", 1)))
         self.cold_start_updates = max(1.0, float(policy_cfg.get("cold_start_updates", 2.0)))
         self.edge_slots = int(policy_cfg.get("edge_slots", 40))
         self.edge_posterior_momentum = float(policy_cfg.get("edge_posterior_momentum", 0.80))
@@ -105,6 +150,16 @@ class AgenticTrainingController:
         self.stop_min_utility = float(stop_cfg.get("min_utility", 0.0))
         self.stop_horizon_windows = max(1, int(stop_cfg.get("horizon_windows", self.stop_patience_windows)))
 
+        self.policy = (
+            AgenticPolicyMLP(
+                input_dim=self.policy_input_dim,
+                hidden_dim=int(policy_cfg.get("hidden_dim", 32)),
+                dropout=float(policy_cfg.get("dropout", 0.0)),
+            )
+            if self.learnable_policy
+            else None
+        )
+
         self.last_map: Optional[float] = None
         self.gain_ema = 0.0
         self.stop_window_count = 0
@@ -113,7 +168,67 @@ class AgenticTrainingController:
     def logs_agent_style(self) -> bool:
         return self.enabled and self.log_style == "agent"
 
-    @torch.no_grad()
+    def _row_norm(self, value: Optional[torch.Tensor], batch_size: int, device: torch.device) -> torch.Tensor:
+        if not torch.is_tensor(value):
+            return torch.zeros(batch_size, dtype=torch.float32, device=device)
+        value = value.detach().float().to(device)
+        if value.shape[0] != batch_size:
+            return torch.zeros(batch_size, dtype=torch.float32, device=device)
+        flat = value.flatten(start_dim=1)
+        denom = float(max(1, flat.shape[1])) ** 0.5
+        return torch.nan_to_num(flat.norm(dim=1) / denom, nan=0.0, posinf=0.0, neginf=0.0)
+
+    def _row_abs_mean(self, value: Optional[torch.Tensor], batch_size: int, device: torch.device) -> torch.Tensor:
+        if not torch.is_tensor(value):
+            return torch.zeros(batch_size, dtype=torch.float32, device=device)
+        value = value.detach().float().to(device)
+        if value.shape[0] != batch_size:
+            return torch.zeros(batch_size, dtype=torch.float32, device=device)
+        return torch.nan_to_num(value.flatten(start_dim=1).abs().mean(dim=1), nan=0.0, posinf=0.0, neginf=0.0)
+
+    def _policy_state(
+        self,
+        outputs: Dict[str, torch.Tensor],
+        p_s: torch.Tensor,
+        p_t: torch.Tensor,
+        p_final: torch.Tensor,
+        p_random: torch.Tensor,
+        trust: torch.Tensor,
+        cold_gate: torch.Tensor,
+        valid: torch.Tensor,
+        epoch: int,
+    ) -> torch.Tensor:
+        batch_size = int(outputs["u_a"].shape[0])
+        device = outputs["u_a"].device
+        margin = torch.nan_to_num(p_final - p_random, nan=0.0, posinf=0.0, neginf=0.0)
+        branch_delta = torch.nan_to_num(p_s - p_t, nan=0.0, posinf=0.0, neginf=0.0)
+        epoch_frac = torch.full(
+            (batch_size,),
+            min(1.0, max(0.0, float(epoch) / float(self.total_epochs))),
+            dtype=torch.float32,
+            device=device,
+        )
+        h_s = outputs.get("h_s_a", outputs.get("h_s"))
+        return torch.stack(
+            [
+                p_s.detach(),
+                p_t.detach(),
+                p_final.detach(),
+                p_random.detach(),
+                branch_delta.detach(),
+                margin.detach(),
+                trust.detach(),
+                cold_gate.detach(),
+                self._row_norm(h_s, batch_size, device),
+                self._row_norm(outputs.get("h_f_a"), batch_size, device),
+                self._row_abs_mean(outputs.get("u_s_a"), batch_size, device),
+                self._row_abs_mean(outputs.get("u_f_a"), batch_size, device),
+                epoch_frac,
+                valid.detach(),
+            ],
+            dim=1,
+        )
+
     def act(
         self,
         outputs: Dict[str, torch.Tensor],
@@ -128,6 +243,7 @@ class AgenticTrainingController:
         omega = torch.ones(batch_size, device=device, dtype=torch.float32)
         budget = torch.full((batch_size,), self.budget_max, device=device, dtype=torch.float32)
         trust = torch.zeros(batch_size, device=device, dtype=torch.float32)
+        route_target = torch.full((batch_size,), self.alpha_default, device=device, dtype=torch.float32)
         ctx = {}
         memory_state = {}
 
@@ -144,13 +260,36 @@ class AgenticTrainingController:
             cold_gate = (update_count / self.cold_start_updates).clamp(0.0, 1.0)
             margin = torch.nan_to_num(p_final - p_random, nan=0.0, posinf=0.0, neginf=0.0)
             trust = torch.sigmoid(self.trust_kappa * (margin - self.trust_center)) * valid * cold_gate
+            route_logit = self.alpha_kappa * torch.nan_to_num(p_s - p_t, nan=0.0) + self.alpha_bias
+            heuristic_alpha = torch.sigmoid(route_logit).clamp(0.02, 0.98)
+            route_target = torch.sigmoid(self.route_target_kappa * torch.nan_to_num(p_s - p_t, nan=0.0)).clamp(0.02, 0.98)
+            route_target = torch.where(valid.bool(), route_target, route_target.new_full(route_target.shape, self.alpha_default))
+            heuristic_omega = (1.0 + self.omega_scale * (trust - 0.5)).clamp(self.omega_min, self.omega_max)
 
             if self.route_enabled:
-                route_logit = self.alpha_kappa * torch.nan_to_num(p_s - p_t, nan=0.0) + self.alpha_bias
-                routed_alpha = torch.sigmoid(route_logit).clamp(0.02, 0.98)
-                alpha = torch.where(valid.bool(), routed_alpha, alpha)
+                alpha = torch.where(valid.bool(), heuristic_alpha, alpha)
             if self.sample_weight_enabled:
-                omega = (1.0 + self.omega_scale * (trust - 0.5)).clamp(self.omega_min, self.omega_max)
+                omega = heuristic_omega
+            if self.policy is not None:
+                policy_state = self._policy_state(
+                    outputs,
+                    p_s.to(device=device, dtype=torch.float32),
+                    p_t.to(device=device, dtype=torch.float32),
+                    p_final.to(device=device, dtype=torch.float32),
+                    p_random.to(device=device, dtype=torch.float32),
+                    trust,
+                    cold_gate.to(device=device, dtype=torch.float32),
+                    valid.to(device=device, dtype=torch.float32),
+                    epoch,
+                )
+                alpha_delta, omega_delta = self.policy(policy_state)
+                if self.route_enabled:
+                    heuristic_logit = torch.logit(heuristic_alpha.clamp(1e-4, 1.0 - 1e-4))
+                    learned_alpha = torch.sigmoid(heuristic_logit + alpha_delta).clamp(0.02, 0.98)
+                    alpha = torch.where(valid.bool(), learned_alpha, alpha)
+                if self.sample_weight_enabled:
+                    learned_omega = heuristic_omega + self.policy_omega_delta * torch.tanh(omega_delta)
+                    omega = learned_omega.clamp(self.omega_min, self.omega_max)
             budget = (self.budget_min + trust * float(self.budget_max - self.budget_min)).round()
             budget = budget.clamp(self.budget_min, self.budget_max)
             if hasattr(planner_memory, "edge_summary"):
@@ -190,6 +329,7 @@ class AgenticTrainingController:
             "budget": budget,
             "top_r": action_top_r,
             "trust": trust,
+            "route_target": route_target.detach(),
             "state": {
                 "h_s": outputs.get("h_s_a", outputs.get("h_s")).detach() if torch.is_tensor(outputs.get("h_s_a", outputs.get("h_s"))) else None,
                 "h_f": outputs.get("h_f_a").detach() if torch.is_tensor(outputs.get("h_f_a")) else None,
@@ -219,6 +359,7 @@ class AgenticTrainingController:
                 "agent_obs_final": _float_value(ctx.get("planner_p_final_topm", 0.0)),
                 "agent_obs_random": _float_value(ctx.get("planner_p_random", 0.0)),
                 "agent_obs_valid": _float_value(ctx.get("planner_valid", 0.0)),
+                "agent_policy_learnable": float(self.policy is not None),
             },
         }
         return action
@@ -278,6 +419,7 @@ class AgenticTrainingController:
             f"stable={_metric(memory_metrics, 'memory_edge_stability'):.3f}) "
             f"adapt(loss={_metric(losses, 'loss'):.4f} "
             f"aucl={_metric(losses, 'component_agentic_contrastive', _metric(losses, 'loss_semantic')):.4f} "
+            f"route={_metric(losses, 'component_route'):.4f} "
             f"hash={_metric(losses, 'loss_hash'):.4f} "
             f"q={_metric(losses, 'component_quant'):.4f} "
             f"bal={_metric(losses, 'component_bit_balance'):.4f} "
@@ -308,6 +450,7 @@ class AgenticTrainingController:
             f"edge_false={stats.get('memory_edge_false_ratio', 0.0):.3f} "
             f"stable={stats.get('memory_edge_stability', 0.0):.3f}) "
             f"adapt(loss={stats.get('loss', 0.0):.4f} aucl={stats.get('component_agentic_contrastive', stats.get('loss_semantic', 0.0)):.4f} "
+            f"route={stats.get('component_route', 0.0):.4f} "
             f"hash={stats.get('loss_hash', 0.0):.4f})"
         )
 

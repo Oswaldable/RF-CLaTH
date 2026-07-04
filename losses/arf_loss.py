@@ -1374,6 +1374,12 @@ class AgenticUnifiedContrastiveLoss(ContrastiveARFLoss):
         self.false_edge_factor_max = float(agentic_cfg.get("false_edge_factor_max", self.hard_negative_weight))
         policy_cfg = cfg.get("agentic", {}).get("policy", {})
         self.edge_decay_gamma = float(agentic_cfg.get("edge_decay_gamma", policy_cfg.get("edge_decay_gamma", 0.98)))
+        route_cfg = agentic_cfg.get("route_loss", agentic_cfg.get("route", {}))
+        self.lambda_route = float(route_cfg.get("lambda", route_cfg.get("lambda_route", agentic_cfg.get("lambda_route", 0.0))))
+        self.route_min_trust = float(route_cfg.get("min_trust", 0.0))
+        self.route_collapse_only = bool(route_cfg.get("collapse_only", False))
+        self.route_entropy_low = float(route_cfg.get("entropy_low", 0.05))
+        self.route_entropy_high = float(route_cfg.get("entropy_high", 0.98))
 
     def _source_addition(self, mask: torch.Tensor, weight: float) -> torch.Tensor:
         if weight <= 0 or mask.numel() == 0:
@@ -1587,6 +1593,64 @@ class AgenticUnifiedContrastiveLoss(ContrastiveARFLoss):
                 return bool(default)
             return bool(value.detach().cpu().item())
         return bool(value)
+
+    def _route_calibration_loss(self, outputs: Dict[str, torch.Tensor]) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+        device = outputs["u_a"].device
+        zero = torch.zeros((), device=device)
+        action = self._agent_action(outputs)
+        alpha = action.get("alpha", None)
+        target = action.get("route_target", None)
+        trust = action.get("trust", None)
+        if self.lambda_route <= 0 or not torch.is_tensor(alpha) or not torch.is_tensor(target):
+            return zero, {
+                "component_route": zero,
+                "loss_route": zero,
+                "route_target_mean": zero,
+                "route_weight_mean": zero,
+            }
+
+        alpha = alpha.to(device=device, dtype=torch.float32).flatten()
+        target = target.to(device=device, dtype=torch.float32).flatten().detach()
+        if alpha.numel() == 0 or alpha.numel() != target.numel():
+            return zero, {
+                "component_route": zero,
+                "loss_route": zero,
+                "route_target_mean": zero,
+                "route_weight_mean": zero,
+            }
+        if torch.is_tensor(trust) and trust.numel() == alpha.numel():
+            weight = trust.to(device=device, dtype=torch.float32).flatten().detach().clamp(0.0, 1.0)
+        else:
+            weight = torch.ones_like(alpha)
+        if self.route_min_trust > 0:
+            weight = torch.where(weight >= float(self.route_min_trust), weight, torch.zeros_like(weight))
+
+        p = alpha.detach().clamp(1e-6, 1.0 - 1e-6)
+        entropy = -(p * torch.log2(p) + (1.0 - p) * torch.log2(1.0 - p)).mean()
+        if self.route_collapse_only and self.route_entropy_low <= float(entropy.cpu().item()) <= self.route_entropy_high:
+            return zero, {
+                "component_route": zero,
+                "loss_route": zero,
+                "route_target_mean": target.mean(),
+                "route_weight_mean": weight.mean(),
+                "route_entropy": entropy.to(device),
+            }
+
+        bce = F.binary_cross_entropy(
+            alpha.clamp(1e-6, 1.0 - 1e-6),
+            target.clamp(1e-6, 1.0 - 1e-6),
+            reduction="none",
+        )
+        denom = weight.sum().clamp_min(1e-6)
+        component_route = (bce * weight).sum() / denom
+        loss_route = float(self.lambda_route) * component_route
+        return loss_route, {
+            "component_route": component_route,
+            "loss_route": loss_route,
+            "route_target_mean": target.mean(),
+            "route_weight_mean": weight.mean(),
+            "route_entropy": entropy.to(device),
+        }
 
     def _memory_valid_indices(self, memory, action: Dict) -> torch.Tensor:
         valid_mask = memory.u_valid
@@ -1977,13 +2041,14 @@ class AgenticUnifiedContrastiveLoss(ContrastiveARFLoss):
             "targets_a": metrics["targets_a"],
             "targets_b": metrics["targets_b"],
         }
+        loss_route, route_metrics = self._route_calibration_loss(outputs)
         component_quant = self.quantization(outputs["u_a"], outputs["u_b"])
         component_bit_balance = self.balance(outputs["u_a"], outputs["u_b"])
         loss_hash = (
             float(schedule["lambda_quant"]) * component_quant
             + float(schedule["lambda_balance"]) * component_bit_balance
         )
-        total = component_agentic + loss_hash
+        total = component_agentic + loss_hash + loss_route
 
         targets_a = metrics["targets_a"]
         targets_b = metrics["targets_b"]
@@ -2000,11 +2065,13 @@ class AgenticUnifiedContrastiveLoss(ContrastiveARFLoss):
             "component_arf_static": zero,
             "component_arf_contrastive": zero,
             "component_agentic_contrastive": component_agentic,
+            "component_route": route_metrics["component_route"],
             "component_quant": component_quant,
             "component_bit_balance": component_bit_balance,
             "loss_view": zero,
-            "loss_semantic": component_agentic,
+            "loss_semantic": component_agentic + loss_route,
             "loss_arf": zero,
+            "loss_route": loss_route,
             "loss_hash": loss_hash,
             "loss": total,
             "metric_agentic_raw": component_agentic.detach(),
@@ -2021,6 +2088,9 @@ class AgenticUnifiedContrastiveLoss(ContrastiveARFLoss):
             "metric_agentic_route_alpha_std": metrics["route_alpha_std"],
             "metric_agentic_route_omega": metrics["route_omega_mean"],
             "metric_agentic_route_omega_std": metrics["route_omega_std"],
+            "metric_agentic_route_target": route_metrics["route_target_mean"],
+            "metric_agentic_route_weight": route_metrics["route_weight_mean"],
+            "metric_agentic_route_loss": route_metrics["component_route"],
             "metric_agentic_routed_similarity": metrics["route_enabled"],
             "metric_agentic_sample_weighting": metrics["sample_weight_enabled"],
             "metric_agentic_edge_factor": metrics["edge_factor_mean"],
@@ -2139,13 +2209,14 @@ class PhasedAgenticUnifiedContrastiveLoss(AgenticUnifiedContrastiveLoss):
             "targets_a": metrics["targets_a"],
             "targets_b": metrics["targets_b"],
         }
+        loss_route, route_metrics = self._route_calibration_loss(outputs)
         component_quant = self.quantization(outputs["u_a"], outputs["u_b"])
         component_bit_balance = self.balance(outputs["u_a"], outputs["u_b"])
         loss_hash = (
             float(schedule["lambda_quant"]) * component_quant
             + float(schedule["lambda_balance"]) * component_bit_balance
         )
-        total = component_agentic + loss_hash
+        total = component_agentic + loss_hash + loss_route
 
         targets_a = metrics["targets_a"]
         targets_b = metrics["targets_b"]
@@ -2162,11 +2233,13 @@ class PhasedAgenticUnifiedContrastiveLoss(AgenticUnifiedContrastiveLoss):
             "component_arf_static": zero,
             "component_arf_contrastive": zero,
             "component_agentic_contrastive": component_agentic,
+            "component_route": route_metrics["component_route"],
             "component_quant": component_quant,
             "component_bit_balance": component_bit_balance,
             "loss_view": zero,
-            "loss_semantic": component_agentic,
+            "loss_semantic": component_agentic + loss_route,
             "loss_arf": zero,
+            "loss_route": loss_route,
             "loss_hash": loss_hash,
             "loss": total,
             "metric_agentic_raw": component_agentic.detach(),
@@ -2183,6 +2256,9 @@ class PhasedAgenticUnifiedContrastiveLoss(AgenticUnifiedContrastiveLoss):
             "metric_agentic_route_alpha_std": metrics["route_alpha_std"],
             "metric_agentic_route_omega": metrics["route_omega_mean"],
             "metric_agentic_route_omega_std": metrics["route_omega_std"],
+            "metric_agentic_route_target": route_metrics["route_target_mean"],
+            "metric_agentic_route_weight": route_metrics["route_weight_mean"],
+            "metric_agentic_route_loss": route_metrics["component_route"],
             "metric_agentic_routed_similarity": metrics["route_enabled"],
             "metric_agentic_sample_weighting": metrics["sample_weight_enabled"],
             "metric_agentic_edge_factor": metrics["edge_factor_mean"],
