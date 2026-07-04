@@ -25,6 +25,14 @@ def _safe_std(values: torch.Tensor) -> float:
     return float(values[finite].std(unbiased=False).detach().cpu().item())
 
 
+def _row_safe_mean(values: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+    if values.numel() == 0:
+        return torch.zeros(values.shape[0], dtype=torch.float32, device=values.device)
+    values = torch.nan_to_num(values.float(), nan=0.0, posinf=0.0, neginf=0.0)
+    mask_f = mask.float()
+    return (values * mask_f).sum(dim=1) / mask_f.sum(dim=1).clamp_min(1.0)
+
+
 def _topk(sim: torch.Tensor, k: int) -> Tuple[torch.Tensor, torch.Tensor]:
     if sim.shape[1] == 0 or k <= 0:
         empty_values = sim.new_empty(sim.shape[0], 0)
@@ -170,6 +178,64 @@ class RetrievalGraphPlanner:
         label_precision = self._label_precision(memory.labels, anchors, n_final)
         if label_precision is not None:
             metrics["planner_label_precision_topm"] = label_precision
+        return metrics
+
+    @torch.no_grad()
+    def action_context(
+        self,
+        memory: PlannerMemoryBank,
+        anchor_indices: torch.Tensor,
+    ) -> Dict[str, torch.Tensor]:
+        """Return per-anchor planner context for the outer agent policy."""
+
+        anchors = anchor_indices.detach().long().to(memory.device)
+        batch_size = anchors.shape[0]
+        zero = torch.zeros(batch_size, dtype=torch.float32, device=memory.device)
+        metrics = {
+            "planner_valid": zero,
+            "planner_p_s_topm": zero,
+            "planner_p_t_topm": zero,
+            "planner_p_z_topm": zero,
+            "planner_p_final_topm": zero,
+            "planner_p_random": zero,
+            "planner_p_final_std": zero,
+        }
+        sem_dyn_valid = memory.sem_dyn_valid
+        final_valid = sem_dyn_valid & memory.u_valid if self.omega_z > 0 else sem_dyn_valid
+        if self.omega_z > 0:
+            final_valid = final_valid & memory.z_valid
+        candidates = self._candidate_indices(final_valid)
+        if candidates.numel() <= 1:
+            return metrics
+
+        p_final, p_s, p_t, p_z = self._final_scores(memory, anchors, candidates)
+        s_top_values, _ = _topk(p_s, self.top_m)
+        t_top_values, _ = _topk(p_t, self.top_m)
+        f_top_values, _ = _topk(p_final, self.top_m)
+        s_mask = torch.isfinite(s_top_values)
+        t_mask = torch.isfinite(t_top_values)
+        f_mask = torch.isfinite(f_top_values)
+
+        metrics["planner_valid"] = torch.ones(batch_size, dtype=torch.float32, device=memory.device)
+        metrics["planner_p_s_topm"] = _row_safe_mean(s_top_values, s_mask)
+        metrics["planner_p_t_topm"] = _row_safe_mean(t_top_values, t_mask)
+        metrics["planner_p_final_topm"] = _row_safe_mean(f_top_values, f_mask)
+        metrics["planner_p_final_std"] = torch.nan_to_num(f_top_values.float(), nan=0.0).std(dim=1, unbiased=False)
+        if p_z is not None:
+            z_top_values, _ = _topk(p_z, self.top_m)
+            metrics["planner_p_z_topm"] = _row_safe_mean(z_top_values, torch.isfinite(z_top_values))
+
+        random_count = max(1, int(self.random_anchors))
+        draws = torch.randint(
+            low=0,
+            high=candidates.numel(),
+            size=(batch_size, random_count),
+            device=memory.device,
+        )
+        random_candidates = candidates[draws]
+        random_values = p_final.gather(dim=1, index=draws)
+        random_mask = (random_candidates != anchors.unsqueeze(1)) & torch.isfinite(random_values)
+        metrics["planner_p_random"] = _row_safe_mean(random_values, random_mask)
         return metrics
 
     @torch.no_grad()
@@ -380,7 +446,19 @@ class RetrievalGraphPlanner:
             "target_mask": target_mask,
             "target_weights": weights,
             "planned_indices": planned_indices,
+            "planned_scores": torch.clamp(
+                torch.nan_to_num(planned_values, nan=0.0, posinf=0.0, neginf=0.0),
+                0.0,
+                1.0,
+            ),
+            "planned_mask": planned_mask,
             "actual_indices": actual_indices,
+            "actual_scores": torch.clamp(
+                torch.nan_to_num(actual_scores, nan=0.0, posinf=0.0, neginf=0.0),
+                0.0,
+                1.0,
+            ),
+            "actual_mask": actual_mask,
             "metric_actual_overlap": overlap,
             "metric_false_ratio": false_ratio,
             "metric_missed_ratio": missed_ratio,

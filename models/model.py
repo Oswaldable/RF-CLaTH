@@ -224,6 +224,8 @@ class RetrievalFeedbackContentLateralTemporalHashing(nn.Module):
 
         if self.use_slow:
             h_s = None if self.use_lateral_fusion else self.slow_encoder(x_s, full=x, selected_indices=selected_indices)
+            h_s_a = h_s
+            h_s_b = h_s
             if self.fast_input_frames == "all":
                 x_fast_source = x
                 fast_indices = torch.arange(x.shape[1], device=x.device).unsqueeze(0).expand(x.shape[0], -1)
@@ -235,6 +237,8 @@ class RetrievalFeedbackContentLateralTemporalHashing(nn.Module):
             fast_indices = torch.arange(x.shape[1], device=x.device).unsqueeze(0).expand(x.shape[0], -1)
             x_s = x[:, :0]
             selected_indices = torch.empty(x.shape[0], 0, device=x.device, dtype=torch.long)
+            h_s_a = h_s
+            h_s_b = h_s
 
         if self.use_fast:
             if return_one_view:
@@ -274,17 +278,29 @@ class RetrievalFeedbackContentLateralTemporalHashing(nn.Module):
         else:
             z_a = self._fuse_or_bypass(h_s, h_f_a)
             z_b = self._fuse_or_bypass(h_s, h_f_b)
+            h_s_a = h_s
+            h_s_b = h_s
         u_a = self.hash_head(z_a)
         u_b = self.hash_head(z_b)
+        u_s_a = self.hash_head(h_s_a) if self.use_slow else torch.zeros_like(u_a)
+        u_s_b = self.hash_head(h_s_b) if self.use_slow else torch.zeros_like(u_b)
+        u_f_a = self.hash_head(h_f_a) if self.use_fast else torch.zeros_like(u_a)
+        u_f_b = self.hash_head(h_f_b) if self.use_fast else torch.zeros_like(u_b)
 
         outputs = {
             "h_s": h_s,
+            "h_s_a": h_s_a,
+            "h_s_b": h_s_b,
             "h_f_a": h_f_a,
             "h_f_b": h_f_b,
             "z_a": z_a,
             "z_b": z_b,
             "u_a": u_a,
             "u_b": u_b,
+            "u_s_a": u_s_a,
+            "u_s_b": u_s_b,
+            "u_f_a": u_f_a,
+            "u_f_b": u_f_b,
             "selected_indices": selected_indices,
             "fast_indices": fast_indices,
             "slow_mask": slow_mask,

@@ -8,6 +8,7 @@ import torch
 from torch import nn
 from torch.utils.data import DataLoader
 
+from agentic import AgenticTrainingController
 from datasets.video_dataset import build_dataloaders
 from engine.evaluate import evaluate_retrieval
 from losses import (
@@ -152,6 +153,7 @@ def train_one_epoch(
     neighbor_indices: Optional[torch.Tensor] = None,
     planner_memory: Optional[PlannerMemoryBank] = None,
     graph_planner: Optional[RetrievalGraphPlanner] = None,
+    agent_controller: Optional[AgenticTrainingController] = None,
 ) -> Dict[str, float]:
     model.train()
     criterion.train()
@@ -170,6 +172,8 @@ def train_one_epoch(
     metric_count = 0
     planner_totals = {}
     planner_count = 0
+    agent_totals = {}
+    agent_count = 0
     actual_steps = 0
     start = time.time()
     for step, batch in enumerate(dataloader, start=1):
@@ -194,9 +198,23 @@ def train_one_epoch(
                         epoch=epoch,
                         u_a=outputs["u_a"].detach(),
                         u_b=outputs["u_b"].detach(),
+                        u_s_a=outputs["u_s_a"].detach() if "u_s_a" in outputs else None,
+                        u_s_b=outputs["u_s_b"].detach() if "u_s_b" in outputs else None,
+                        u_f_a=outputs["u_f_a"].detach() if "u_f_a" in outputs else None,
+                        u_f_b=outputs["u_f_b"].detach() if "u_f_b" in outputs else None,
                     )
                 outputs["planner_memory"] = planner_memory
                 outputs["graph_planner"] = graph_planner
+            agent_action = {}
+            if agent_controller is not None:
+                agent_action = agent_controller.act(
+                    outputs,
+                    planner_memory,
+                    graph_planner,
+                    batch_indices_cpu,
+                    epoch=epoch,
+                )
+                outputs["agent_action"] = agent_action
             losses = criterion(outputs)
             loss = losses["loss"]
         scaler.scale(loss).backward()
@@ -219,27 +237,28 @@ def train_one_epoch(
                     for key, value in planner_metrics.items():
                         planner_totals[key] = planner_totals.get(key, 0.0) + float(value)
                     planner_count += 1
-                    logger.info(
-                        "epoch=%d step=%d/%d planner_sanity valid=%.3f z_valid=%.3f "
-                        "p_s_topm=%.4f p_t_topm=%.4f p_z_topm=%.4f p_final_topm=%.4f "
-                        "p_random=%.4f p_final_std=%.4f overlap_s_t=%.3f "
-                        "overlap_final_s=%.3f overlap_final_t=%.3f label_prec=%.3f",
-                        epoch,
-                        step,
-                        len(dataloader),
-                        planner_metrics.get("planner_valid_final", 0.0),
-                        planner_metrics.get("planner_valid_z", 0.0),
-                        planner_metrics.get("planner_p_s_topm", 0.0),
-                        planner_metrics.get("planner_p_t_topm", 0.0),
-                        planner_metrics.get("planner_p_z_topm", 0.0),
-                        planner_metrics.get("planner_p_final_topm", 0.0),
-                        planner_metrics.get("planner_p_random", 0.0),
-                        planner_metrics.get("planner_p_final_std", 0.0),
-                        planner_metrics.get("planner_overlap_s_t", 0.0),
-                        planner_metrics.get("planner_overlap_final_s", 0.0),
-                        planner_metrics.get("planner_overlap_final_t", 0.0),
-                        planner_metrics.get("planner_label_precision_topm", 0.0),
-                    )
+                    if not (agent_controller is not None and agent_controller.logs_agent_style):
+                        logger.info(
+                            "epoch=%d step=%d/%d planner_sanity valid=%.3f z_valid=%.3f "
+                            "p_s_topm=%.4f p_t_topm=%.4f p_z_topm=%.4f p_final_topm=%.4f "
+                            "p_random=%.4f p_final_std=%.4f overlap_s_t=%.3f "
+                            "overlap_final_s=%.3f overlap_final_t=%.3f label_prec=%.3f",
+                            epoch,
+                            step,
+                            len(dataloader),
+                            planner_metrics.get("planner_valid_final", 0.0),
+                            planner_metrics.get("planner_valid_z", 0.0),
+                            planner_metrics.get("planner_p_s_topm", 0.0),
+                            planner_metrics.get("planner_p_t_topm", 0.0),
+                            planner_metrics.get("planner_p_z_topm", 0.0),
+                            planner_metrics.get("planner_p_final_topm", 0.0),
+                            planner_metrics.get("planner_p_random", 0.0),
+                            planner_metrics.get("planner_p_final_std", 0.0),
+                            planner_metrics.get("planner_overlap_s_t", 0.0),
+                            planner_metrics.get("planner_overlap_final_s", 0.0),
+                            planner_metrics.get("planner_overlap_final_t", 0.0),
+                            planner_metrics.get("planner_label_precision_topm", 0.0),
+                        )
 
         for key, value in losses.items():
             totals[key] = totals.get(key, 0.0) + float(value.detach().cpu())
@@ -249,8 +268,29 @@ def train_one_epoch(
             hash_metrics = compute_self_supervised_hash_metrics(outputs)
             for key, value in hash_metrics.items():
                 metric_totals[key] = metric_totals.get(key, 0.0) + value
+            memory_metrics = agent_controller.memory_summary(planner_memory, batch_indices_cpu) if agent_controller else {}
+            action_metrics = agent_action.get("metrics", {}) if isinstance(agent_action, dict) else {}
+            for key, value in action_metrics.items():
+                agent_totals[key] = agent_totals.get(key, 0.0) + float(value)
+            for key, value in memory_metrics.items():
+                agent_totals[key] = agent_totals.get(key, 0.0) + float(value)
+            agent_count += 1
             metric_count += 1
-            logger.info(
+            if agent_controller is not None and agent_controller.logs_agent_style:
+                logger.info(
+                    agent_controller.format_step(
+                        epoch,
+                        step,
+                        len(dataloader),
+                        losses,
+                        hash_metrics,
+                        agent_action,
+                        planner_metrics,
+                        memory_metrics,
+                    )
+                )
+            else:
+                logger.info(
                 "epoch=%d step=%d/%d loss=%.4f view=%.4f semantic=%.4f hash=%.4f "
                 "view_raw=%.4f batch_neigh=%.4f mem_neigh=%.4f arf_raw=%.4f "
                 "quant=%.4f bit_bal=%.4f arf_targets=%.1f arf_target=%.3f arf_hpos=%.1f arf_hard=%.1f "
@@ -318,7 +358,7 @@ def train_one_epoch(
                 hash_metrics["metric_soft_saturation"],
                 hash_metrics.get("metric_mask_ratio", 0.0),
                 hash_metrics.get("metric_fast_cos", 0.0),
-            )
+                )
 
         if max_steps > 0 and step >= max_steps:
             break
@@ -327,28 +367,35 @@ def train_one_epoch(
     averaged = {key: value / count for key, value in totals.items()}
     metric_divisor = max(1, metric_count)
     averaged.update({key: value / metric_divisor for key, value in metric_totals.items()})
+    if agent_count > 0:
+        averaged.update({key: value / agent_count for key, value in agent_totals.items()})
+    averaged["train_time_sec"] = time.time() - start
     if planner_count > 0:
         averaged.update({key: value / planner_count for key, value in planner_totals.items()})
+        if not (agent_controller is not None and agent_controller.logs_agent_style):
+            logger.info(
+                "epoch=%d planner_sanity_avg valid=%.3f z_valid=%.3f "
+                "p_s_topm=%.4f p_t_topm=%.4f p_z_topm=%.4f p_final_topm=%.4f "
+                "p_random=%.4f p_final_std=%.4f overlap_s_t=%.3f "
+                "overlap_final_s=%.3f overlap_final_t=%.3f label_prec=%.3f",
+                epoch,
+                averaged.get("planner_valid_final", 0.0),
+                averaged.get("planner_valid_z", 0.0),
+                averaged.get("planner_p_s_topm", 0.0),
+                averaged.get("planner_p_t_topm", 0.0),
+                averaged.get("planner_p_z_topm", 0.0),
+                averaged.get("planner_p_final_topm", 0.0),
+                averaged.get("planner_p_random", 0.0),
+                averaged.get("planner_p_final_std", 0.0),
+                averaged.get("planner_overlap_s_t", 0.0),
+                averaged.get("planner_overlap_final_s", 0.0),
+                averaged.get("planner_overlap_final_t", 0.0),
+                averaged.get("planner_label_precision_topm", 0.0),
+            )
+    if agent_controller is not None and agent_controller.logs_agent_style:
+        logger.info(agent_controller.format_epoch(epoch, averaged))
+    else:
         logger.info(
-            "epoch=%d planner_sanity_avg valid=%.3f z_valid=%.3f "
-            "p_s_topm=%.4f p_t_topm=%.4f p_z_topm=%.4f p_final_topm=%.4f "
-            "p_random=%.4f p_final_std=%.4f overlap_s_t=%.3f "
-            "overlap_final_s=%.3f overlap_final_t=%.3f label_prec=%.3f",
-            epoch,
-            averaged.get("planner_valid_final", 0.0),
-            averaged.get("planner_valid_z", 0.0),
-            averaged.get("planner_p_s_topm", 0.0),
-            averaged.get("planner_p_t_topm", 0.0),
-            averaged.get("planner_p_z_topm", 0.0),
-            averaged.get("planner_p_final_topm", 0.0),
-            averaged.get("planner_p_random", 0.0),
-            averaged.get("planner_p_final_std", 0.0),
-            averaged.get("planner_overlap_s_t", 0.0),
-            averaged.get("planner_overlap_final_s", 0.0),
-            averaged.get("planner_overlap_final_t", 0.0),
-            averaged.get("planner_label_precision_topm", 0.0),
-        )
-    logger.info(
         "epoch=%d train_time=%.1fs loss=%.4f view=%.4f semantic=%.4f hash=%.4f "
         "view_raw=%.4f batch_neigh=%.4f mem_neigh=%.4f arf_raw=%.4f "
         "quant=%.4f bit_bal=%.4f arf_targets=%.1f arf_target=%.3f arf_hpos=%.1f arf_hard=%.1f "
@@ -419,7 +466,7 @@ def train_one_epoch(
         averaged.get("metric_mask_ratio", 0.0),
         averaged.get("metric_fast_cos", 0.0),
         averaged.get("metric_fused_cos", 0.0),
-    )
+        )
     return averaged
 
 
@@ -561,6 +608,15 @@ def train_rf_clath(
             planner_device,
             labels is not None,
         )
+    agent_controller = AgenticTrainingController(cfg)
+    if agent_controller.enabled:
+        logger.info(
+            "agentic_controller enabled routed_similarity=%s sample_weight=%s feedback_graph=%s stop_policy=%s",
+            agent_controller.use_routed_similarity,
+            agent_controller.sample_weight_enabled,
+            agent_controller.update_feedback_graph,
+            agent_controller.stop_enabled,
+        )
     save_config(cfg, str(output_dir / "config.yaml"))
     optimizer = build_optimizer(model, criterion, cfg)
     scheduler = build_scheduler(optimizer, cfg)
@@ -603,6 +659,7 @@ def train_rf_clath(
             neighbor_indices=neighbor_indices,
             planner_memory=planner_memory,
             graph_planner=graph_planner,
+            agent_controller=agent_controller,
         )
         scheduler.step()
 
@@ -629,7 +686,8 @@ def train_rf_clath(
                 map_topk=map_topk,
                 gmap_topk=gmap_topk,
             )
-            logger.info("epoch=%d eval %s", epoch, format_retrieval_metrics(metrics, topk, map_topk=map_topk))
+            if not agent_controller.logs_agent_style:
+                logger.info("epoch=%d eval %s", epoch, format_retrieval_metrics(metrics, topk, map_topk=map_topk))
             if metrics["mAP"] > best_map + early_stop_min_delta:
                 best_map = metrics["mAP"]
                 no_improve_evals = 0
@@ -645,6 +703,18 @@ def train_rf_clath(
                 )
             else:
                 no_improve_evals += 1
+            agent_eval_state = agent_controller.observe_eval(epoch, metrics, train_stats)
+            if agent_controller.logs_agent_style:
+                logger.info(agent_controller.format_eval(epoch, metrics, agent_eval_state, best_map))
+            if bool(agent_eval_state.get("agent_eval_stop", False)):
+                logger.info(
+                    "agent_stop epoch=%d reason=%s best_mAP=%.4f",
+                    epoch,
+                    agent_eval_state.get("agent_eval_reason", "stop"),
+                    best_map,
+                )
+                break
+            if metrics["mAP"] <= best_map + early_stop_min_delta:
                 if early_stop_patience > 0 and no_improve_evals >= early_stop_patience:
                     logger.info(
                         "early_stop epoch=%d patience=%d best_mAP=%.4f",

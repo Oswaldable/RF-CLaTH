@@ -1,6 +1,6 @@
 project:
-  name: RF-CLaTH-T-SAS-UCF-RePartition
-  output_dir: ./outputs/rf_clath_t_sas_ucf
+  name: RF-CLaTH-AgenticRetrieval-UCF-RePartition
+  output_dir: ./outputs/rf_clath_agentic_retrieval_ucf
   seed: 3346
 
 data:
@@ -18,10 +18,10 @@ data:
       val_feature_path: /mnt/disk2/yql/dataset_rePartition/ucf/ucf_test_feats.h5
       test_feature_path: /mnt/disk2/yql/dataset_rePartition/ucf/ucf_test_feats.h5
       retrieval_feature_path: /mnt/disk2/yql/dataset_rePartition/ucf/ucf_train_feats.h5
-      train_label_path: ./cache/repartition_ucf_train_label.pt
-      val_label_path: ./cache/repartition_ucf_q_label.pt
-      test_label_path: ./cache/repartition_ucf_q_label.pt
-      retrieval_label_path: ./cache/repartition_ucf_re_label.pt
+      train_label_path: ./cache/repartition_s5vh_ucf_train_label.pt
+      val_label_path: ./cache/repartition_s5vh_ucf_q_label.pt
+      test_label_path: ./cache/repartition_s5vh_ucf_q_label.pt
+      retrieval_label_path: ./cache/repartition_s5vh_ucf_re_label.pt
 
 model:
   input_type: features
@@ -98,7 +98,14 @@ ablation:
   slow_encoder_type: selected_class_attention
   fast_encoder_type: bidirectional_mamba
 
+training:
+  objective: agentic_unified_contrastive
+
 loss:
+  type: agentic_unified_contrastive
+  temperature: 0.2
+  neighbor_temperature: 0.2
+  symmetric_neighbors: true
   view:
     lambda: 0.3
   semantic:
@@ -107,17 +114,72 @@ loss:
   hash:
     lambda_quant: 0.02
     lambda_bit_balance: 0.03
-  temperature: 0.2
-  neighbor_temperature: 0.2
-  symmetric_neighbors: true
-
   memory_neighbor:
     num_items: 0
     start_epoch: 2
     temperature: 0.2
     momentum: 0.9
-    positives_per_anchor: 15
+    positives_per_anchor: 10
     include_self: false
+
+agentic_contrastive:
+  memory_positive_topk: 10
+  arf_positive_topk: 10
+  actual_trace_start_epoch: 30
+  hard_mining_start_epoch: 30
+  normalize_sources: true
+  max_positive_weight: 2.0
+  source_weights:
+    view: 1.0
+    batch_neighbor: 0.75
+    memory_neighbor: 0.25
+    arf_planned: 0.25
+    arf_missed_bonus: 0.25
+  hard_negative_weight: 1.25
+
+agentic:
+  enabled: true
+  log_style: agent
+  policy:
+    route_enabled: true
+    use_routed_similarity: true
+    sample_weight_enabled: true
+    update_feedback_graph: true
+    alpha_default: 0.5
+    alpha_kappa: 6.0
+    alpha_bias: 0.0
+    trust_kappa: 8.0
+    trust_center: 0.02
+    omega_min: 0.5
+    omega_max: 1.5
+    omega_scale: 0.5
+    cold_start_updates: 2
+    edge_slots: 40
+    edge_posterior_momentum: 0.80
+    edge_reliability_momentum: 0.80
+  stop_policy:
+    enabled: true
+    min_epoch: 50
+    patience_windows: 3
+    gain_beta: 0.7
+    min_gain: 0.0001
+    min_memory_stability: 0.95
+    gate_entropy_low: 0.05
+    gate_entropy_high: 0.98
+    cost_weight: 0.0
+    min_utility: 0.0
+
+arf_loss:
+  gamma: 8
+  late_sharpen:
+    start_ratio: 1.10
+    lambda_quant: 0.02
+    lambda_balance: 0.03
+    gamma: 8
+
+loss_weights:
+  lambda_quant: 0.02
+  lambda_balance: 0.03
 
 neighbor:
   enabled: true
@@ -127,23 +189,43 @@ neighbor:
   sim_chunk_size: 512
   build_on_cuda: true
   cache: true
-  cache_path: ./cache/repartition_ucf_train_rawmean_top20.pt
+  cache_path: ./cache/repartition_s5vh_ucf_train_rawmean_top20.pt
   label_precision_probe: 0
 
 planner:
   enabled: true
   top_m: 20
-  omega_s: 0.65
-  omega_t: 0.35
-  omega_z: 0.0
+  omega_s: 0.45
+  omega_t: 0.25
+  omega_z: 0.30
   random_anchors: 40
   z_momentum: 0.9
+  u_momentum: 0.9
   log_interval: 20
   device: auto
   include_z_metrics: true
   label_precision: true
+  warmup:
+    epochs: 10
+    omega_s: 0.65
+    omega_t: 0.35
+    omega_z: 0.0
+
+retrieval_environment:
+  use_actual_trace: true
+  top_r: 20
+  random_anchors: 40
+
+feedback:
+  eta_missed_start: 0.0
+  eta_false_start: 0.0
+  eta_missed_final: 1.0
+  eta_false_final: 1.0
+  ramp_epochs: 10
+  weight_clip: 3.0
 
 train:
+  objective: agentic_unified_contrastive
   batch_size: 256
   epochs: 150
   optimizer: adamw

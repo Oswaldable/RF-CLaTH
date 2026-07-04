@@ -366,6 +366,10 @@ def select_dataset_config(cfg: Dict, dataset_name: Optional[str] = None) -> Dict
     aliases = {
         "act": "activitynet",
         "fcvid": "fcv",
+        "s5vh_activitynet": "activitynet",
+        "s5vh_fcv": "fcv",
+        "s5vh_hmdb": "hmdb",
+        "s5vh_ucf": "ucf",
     }
     if dataset_name not in data_cfg["datasets"]:
         dataset_name = aliases.get(dataset_name, dataset_name)
