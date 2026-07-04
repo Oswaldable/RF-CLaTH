@@ -279,6 +279,7 @@ class PlannerMemoryBank:
         posterior_momentum: float = 0.80,
         reliability_momentum: float = 0.80,
         edge_decay_gamma: float = 0.98,
+        old_edge_reserve_ratio: float = 0.25,
     ):
         planned_indices = targets.get("planned_indices", None)
         actual_indices = targets.get("actual_indices", None)
@@ -318,6 +319,7 @@ class PlannerMemoryBank:
         posterior_momentum = float(posterior_momentum)
         reliability_momentum = float(reliability_momentum)
         edge_decay_gamma = min(1.0, max(0.0, float(edge_decay_gamma)))
+        old_edge_reserve_ratio = min(0.9, max(0.0, float(old_edge_reserve_ratio)))
 
         for row, anchor in enumerate(indices):
             planned = planned_indices[row][planned_mask[row]]
@@ -330,7 +332,7 @@ class PlannerMemoryBank:
             merged = merged[(merged >= 0) & (merged != anchor)]
             if merged.numel() == 0:
                 continue
-            unique_edges = torch.unique(merged, sorted=False)[:slots]
+            observed_edges = torch.unique(merged, sorted=False)
             prev_edges = self.edge_indices[anchor].clone()
             prev_weight = self.edge_weight[anchor].clone()
             prev_posterior = self.edge_posterior[anchor].clone()
@@ -354,8 +356,8 @@ class PlannerMemoryBank:
                     age,
                 )
                 keep_old = old_decay_active > 1e-4
-                if unique_edges.numel() > 0:
-                    keep_old = keep_old & ~((old_edges.unsqueeze(1) == unique_edges.unsqueeze(0)).any(dim=1))
+                if observed_edges.numel() > 0:
+                    keep_old = keep_old & ~((old_edges.unsqueeze(1) == observed_edges.unsqueeze(0)).any(dim=1))
                 old_edges = old_edges[keep_old]
                 old_weight_active = old_weight_active[keep_old]
                 old_posterior_active = old_posterior_active[keep_old]
@@ -364,10 +366,65 @@ class PlannerMemoryBank:
                 old_last_active = old_last_active[keep_old]
                 old_flags_active = old_flags_active[keep_old]
 
-            if old_edges.numel() > 0:
-                current = torch.cat([unique_edges, old_edges], dim=0)[:slots]
+            if observed_edges.numel() > 0:
+                obs_in_planned = (
+                    (observed_edges.unsqueeze(1) == planned.unsqueeze(0)).any(dim=1)
+                    if planned.numel() > 0
+                    else torch.zeros(observed_edges.numel(), dtype=torch.bool, device=self.device)
+                )
+                obs_in_actual = (
+                    (observed_edges.unsqueeze(1) == actual.unsqueeze(0)).any(dim=1)
+                    if actual.numel() > 0
+                    else torch.zeros(observed_edges.numel(), dtype=torch.bool, device=self.device)
+                )
+                obs_success = obs_in_planned & obs_in_actual
+                obs_score = torch.zeros(observed_edges.numel(), dtype=torch.float32, device=self.device)
+                if planned.numel() > 0:
+                    obs_planned_match = observed_edges.unsqueeze(1) == planned.unsqueeze(0)
+                    obs_score = torch.maximum(
+                        obs_score,
+                        (obs_planned_match.float() * planned_score.unsqueeze(0)).max(dim=1).values,
+                    )
+                if actual.numel() > 0:
+                    obs_actual_match = observed_edges.unsqueeze(1) == actual.unsqueeze(0)
+                    obs_score = torch.maximum(
+                        obs_score,
+                        (obs_actual_match.float() * actual_score.unsqueeze(0)).max(dim=1).values,
+                    )
+                observed_priority = (
+                    obs_score
+                    + obs_in_planned.float()
+                    + 0.5 * obs_in_actual.float()
+                    + obs_success.float()
+                )
+                observed_order = torch.argsort(observed_priority, descending=True)
             else:
-                current = unique_edges[:slots]
+                observed_order = torch.empty(0, dtype=torch.long, device=self.device)
+
+            if old_edges.numel() > 0:
+                old_priority = old_weight_active * old_posterior_active * old_reliability_active * old_decay_active
+                old_order = torch.argsort(old_priority, descending=True)
+                old_reserve = min(
+                    int(old_edges.numel()),
+                    int(round(float(slots) * old_edge_reserve_ratio)),
+                )
+                if observed_edges.numel() > 0 and old_reserve >= slots:
+                    old_reserve = slots - 1
+                old_reserve = max(0, old_reserve)
+            else:
+                old_order = torch.empty(0, dtype=torch.long, device=self.device)
+                old_reserve = 0
+
+            observed_keep = min(int(observed_edges.numel()), max(0, slots - old_reserve))
+            old_keep = min(int(old_edges.numel()), slots - observed_keep)
+            if observed_edges.numel() > observed_keep and old_edges.numel() == 0:
+                observed_keep = min(int(observed_edges.numel()), slots)
+            selected_observed = observed_edges[observed_order[:observed_keep]] if observed_keep > 0 else observed_edges[:0]
+            selected_old = old_edges[old_order[:old_keep]] if old_keep > 0 else old_edges[:0]
+            if selected_old.numel() > 0:
+                current = torch.cat([selected_observed, selected_old], dim=0)
+            else:
+                current = selected_observed
             count = int(current.numel())
 
             self.prev_edge_indices[anchor] = prev_edges
@@ -380,8 +437,8 @@ class PlannerMemoryBank:
             self.edge_flags[anchor].zero_()
 
             current_is_observed = (
-                (current.unsqueeze(1) == unique_edges.unsqueeze(0)).any(dim=1)
-                if unique_edges.numel() > 0
+                (current.unsqueeze(1) == observed_edges.unsqueeze(0)).any(dim=1)
+                if observed_edges.numel() > 0
                 else torch.zeros(count, dtype=torch.bool, device=self.device)
             )
             in_planned = (current.unsqueeze(1) == planned.unsqueeze(0)).any(dim=1) if planned.numel() > 0 else torch.zeros(count, dtype=torch.bool, device=self.device)
@@ -561,6 +618,54 @@ class PlannerMemoryBank:
         match = edge_indices.unsqueeze(1) == candidates.view(1, -1, 1)
         matched = match.any(dim=-1)
         matched_value = (match.float() * edge_value.unsqueeze(1)).max(dim=-1).values
+        matched_factor = float(default) + float(boost_scale) * matched_value
+        matched_factor = torch.clamp(matched_factor, min=float(min_factor))
+        if max_factor is not None and float(max_factor) > 0:
+            matched_factor = torch.clamp(matched_factor, max=float(max_factor))
+        return torch.where(matched, matched_factor, factors)
+
+    def false_edge_factor(
+        self,
+        anchor_indices: torch.Tensor,
+        candidate_indices: torch.Tensor,
+        default: float = 1.0,
+        boost_scale: float = 1.0,
+        min_factor: float = 1.0,
+        max_factor: Optional[float] = None,
+        current_epoch: Optional[int] = None,
+        edge_decay_gamma: float = 1.0,
+    ) -> torch.Tensor:
+        anchors = anchor_indices.detach().long().to(self.device)
+        candidates = candidate_indices.detach().long().to(self.device)
+        if candidates.numel() == 0:
+            return torch.empty(anchors.numel(), 0, dtype=torch.float32, device=self.device)
+        factors = torch.full(
+            (anchors.numel(), candidates.numel()),
+            float(default),
+            dtype=torch.float32,
+            device=self.device,
+        )
+        if self.edge_indices is None:
+            return factors
+        edge_indices = self.edge_indices.index_select(0, anchors)
+        edge_mask = edge_indices >= 0
+        flags = self.edge_flags.index_select(0, anchors)
+        false_mask = torch.bitwise_and(flags, torch.ones_like(flags) * 8) != 0
+        edge_mask = edge_mask & false_mask
+        if not bool(edge_mask.any().item()):
+            return factors
+        posterior = self.edge_posterior.index_select(0, anchors).clamp(0.0, 1.0)
+        reliability = self.edge_reliability.index_select(0, anchors).clamp(0.0, 1.0)
+        decay = self.edge_decay.index_select(0, anchors).clamp(0.0, 1.0)
+        if current_epoch is not None:
+            last_epoch = self.edge_last_epoch.index_select(0, anchors)
+            age = (int(current_epoch) - last_epoch).clamp_min(0).float()
+            gamma = min(1.0, max(0.0, float(edge_decay_gamma)))
+            decay = decay * torch.pow(torch.full_like(age, gamma), age)
+        false_value = ((1.0 - posterior) * (1.0 - reliability) * decay).masked_fill(~edge_mask, 0.0)
+        match = edge_indices.unsqueeze(1) == candidates.view(1, -1, 1)
+        matched = match.any(dim=-1)
+        matched_value = (match.float() * false_value.unsqueeze(1)).max(dim=-1).values
         matched_factor = float(default) + float(boost_scale) * matched_value
         matched_factor = torch.clamp(matched_factor, min=float(min_factor))
         if max_factor is not None and float(max_factor) > 0:

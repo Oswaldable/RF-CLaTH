@@ -228,6 +228,7 @@ def train_one_epoch(
                         posterior_momentum=float(agent_action.get("edge_posterior_momentum", 0.80)),
                         reliability_momentum=float(agent_action.get("edge_reliability_momentum", 0.80)),
                         edge_decay_gamma=float(agent_action.get("edge_decay_gamma", 0.98)),
+                        old_edge_reserve_ratio=float(agent_action.get("old_edge_reserve_ratio", 0.25)),
                     )
                 planner_memory.update_batch(
                     batch_indices_cpu,

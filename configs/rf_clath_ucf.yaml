@@ -134,6 +134,10 @@ agentic_contrastive:
   edge_factor_boost: 1.0
   edge_factor_min: 1.0
   edge_factor_max: 2.0
+  false_edge_factor_default: 1.0
+  false_edge_factor_boost: 1.0
+  false_edge_factor_min: 1.0
+  false_edge_factor_max: 1.25
   source_weights:
     view: 1.0
     batch_neighbor: 0.75
@@ -167,6 +171,7 @@ agentic:
     edge_posterior_momentum: 0.80
     edge_reliability_momentum: 0.80
     edge_decay_gamma: 0.98
+    old_edge_reserve_ratio: 0.25
   stop_policy:
     enabled: true
     min_epoch: 50

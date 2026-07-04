@@ -1368,6 +1368,10 @@ class AgenticUnifiedContrastiveLoss(ContrastiveARFLoss):
         self.edge_factor_boost = float(agentic_cfg.get("edge_factor_boost", 1.0))
         self.edge_factor_min = float(agentic_cfg.get("edge_factor_min", 1.0))
         self.edge_factor_max = float(agentic_cfg.get("edge_factor_max", self.max_positive_weight))
+        self.false_edge_factor_default = float(agentic_cfg.get("false_edge_factor_default", 1.0))
+        self.false_edge_factor_boost = float(agentic_cfg.get("false_edge_factor_boost", 1.0))
+        self.false_edge_factor_min = float(agentic_cfg.get("false_edge_factor_min", 1.0))
+        self.false_edge_factor_max = float(agentic_cfg.get("false_edge_factor_max", self.hard_negative_weight))
         policy_cfg = cfg.get("agentic", {}).get("policy", {})
         self.edge_decay_gamma = float(agentic_cfg.get("edge_decay_gamma", policy_cfg.get("edge_decay_gamma", 0.98)))
 
@@ -1775,6 +1779,7 @@ class AgenticUnifiedContrastiveLoss(ContrastiveARFLoss):
         )
         hard_negative_weight = max(1.0, float(source_weights.get("hard_negative_weight", self.hard_negative_weight)))
         if valid_indices.numel() > 0 and hasattr(memory, "edge_factor"):
+            current_epoch = self._current_epoch_value(outputs)
             edge_factor = memory.edge_factor(
                 query_sample_ids,
                 valid_indices,
@@ -1782,13 +1787,32 @@ class AgenticUnifiedContrastiveLoss(ContrastiveARFLoss):
                 boost_scale=self.edge_factor_boost,
                 min_factor=self.edge_factor_min,
                 max_factor=self.edge_factor_max,
-                current_epoch=self._current_epoch_value(outputs),
+                current_epoch=current_epoch,
                 edge_decay_gamma=self.edge_decay_gamma,
             ).to(device=device, dtype=torch.float32)
+            if hasattr(memory, "false_edge_factor"):
+                false_edge_factor = memory.false_edge_factor(
+                    query_sample_ids,
+                    valid_indices,
+                    default=self.false_edge_factor_default,
+                    boost_scale=self.false_edge_factor_boost,
+                    min_factor=self.false_edge_factor_min,
+                    max_factor=self.false_edge_factor_max,
+                    current_epoch=current_epoch,
+                    edge_decay_gamma=self.edge_decay_gamma,
+                ).to(device=device, dtype=torch.float32)
+            else:
+                false_edge_factor = torch.full_like(edge_factor, float(self.false_edge_factor_default))
         else:
             edge_factor = torch.full(
                 (query_count, valid_indices.numel()),
                 float(self.edge_factor_default),
+                dtype=torch.float32,
+                device=device,
+            )
+            false_edge_factor = torch.full(
+                (query_count, valid_indices.numel()),
+                float(self.false_edge_factor_default),
                 dtype=torch.float32,
                 device=device,
             )
@@ -1829,6 +1853,7 @@ class AgenticUnifiedContrastiveLoss(ContrastiveARFLoss):
                 "route_enabled": route_data["metrics"]["route_enabled"],
                 "sample_weight_enabled": route_data["metrics"]["sample_weight_enabled"],
                 "edge_factor_mean": zero,
+                "false_edge_factor_mean": zero,
                 "trace_top_r": torch.tensor(float(trace_top_r), device=device),
                 "semantic_bits": route_data["metrics"]["semantic_bits"],
                 "temporal_bits": route_data["metrics"]["temporal_bits"],
@@ -1840,7 +1865,11 @@ class AgenticUnifiedContrastiveLoss(ContrastiveARFLoss):
             denom_bonus = torch.zeros_like(logits)
             hard_negative_scale = hard_negative_feedback_weight * float(hard_negative_weight)
             hard_negative_scale = hard_negative_scale.clamp_min(1.0)
-            denom_bonus[:, query_count:] = hard_negative_mask.float() * torch.log(hard_negative_scale)
+            persistent_false_mask = false_edge_factor > (float(self.false_edge_factor_default) + 1e-6)
+            positive_memory_active = positive_weights[:, query_count:] > 0
+            denominator_hard_mask = hard_negative_mask | (persistent_false_mask & (~positive_memory_active))
+            denominator_scale = torch.maximum(hard_negative_scale, false_edge_factor).clamp_min(1.0)
+            denom_bonus[:, query_count:] = denominator_hard_mask.float() * torch.log(denominator_scale)
             denom_logits = denom_logits + denom_bonus
         positive_logits = logits + torch.log(positive_weights.clamp_min(1e-12))
         positive_logits = positive_logits.masked_fill(positive_weights <= 0, mask_value)
@@ -1880,6 +1909,9 @@ class AgenticUnifiedContrastiveLoss(ContrastiveARFLoss):
             "sample_weight_enabled": route_data["metrics"]["sample_weight_enabled"],
             "edge_factor_mean": edge_factor[pos_active[:, query_count:]].mean()
             if valid_indices.numel() > 0 and pos_active[:, query_count:].any()
+            else zero,
+            "false_edge_factor_mean": false_edge_factor[false_edge_factor > self.false_edge_factor_default].mean()
+            if valid_indices.numel() > 0 and (false_edge_factor > self.false_edge_factor_default).any()
             else zero,
             "trace_top_r": torch.tensor(float(trace_top_r), device=device),
             "semantic_bits": route_data["metrics"]["semantic_bits"],
@@ -1969,6 +2001,7 @@ class AgenticUnifiedContrastiveLoss(ContrastiveARFLoss):
             "metric_agentic_routed_similarity": metrics["route_enabled"],
             "metric_agentic_sample_weighting": metrics["sample_weight_enabled"],
             "metric_agentic_edge_factor": metrics["edge_factor_mean"],
+            "metric_agentic_false_edge_factor": metrics["false_edge_factor_mean"],
             "metric_agentic_trace_top_r": metrics["trace_top_r"],
             "metric_agentic_semantic_bits": metrics["semantic_bits"],
             "metric_agentic_temporal_bits": metrics["temporal_bits"],
@@ -2128,6 +2161,7 @@ class PhasedAgenticUnifiedContrastiveLoss(AgenticUnifiedContrastiveLoss):
             "metric_agentic_routed_similarity": metrics["route_enabled"],
             "metric_agentic_sample_weighting": metrics["sample_weight_enabled"],
             "metric_agentic_edge_factor": metrics["edge_factor_mean"],
+            "metric_agentic_false_edge_factor": metrics["false_edge_factor_mean"],
             "metric_agentic_trace_top_r": metrics["trace_top_r"],
             "metric_agentic_semantic_bits": metrics["semantic_bits"],
             "metric_agentic_temporal_bits": metrics["temporal_bits"],
