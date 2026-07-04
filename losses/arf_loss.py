@@ -1431,13 +1431,14 @@ class AgenticUnifiedContrastiveLoss(ContrastiveARFLoss):
         valid_indices: torch.Tensor,
         schedule: Dict[str, float | bool],
         hard_mining_enabled: bool,
+        top_r,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Dict[str, torch.Tensor], Dict[str, torch.Tensor]]:
         device = outputs[view_key].device
         targets = planner.arf_trace_targets(
             memory,
             sample_indices,
             outputs[view_key],
-            top_r=self.top_r,
+            top_r=top_r,
             random_anchors=self.random_anchors,
             use_actual_trace=bool(schedule["use_actual_trace"]),
             omega_s=float(schedule["omega_s"]),
@@ -1487,6 +1488,53 @@ class AgenticUnifiedContrastiveLoss(ContrastiveARFLoss):
                 return value
         return torch.full((batch_size,), float(default), dtype=torch.float32, device=device)
 
+    def _action_top_r(self, action: Dict) -> int:
+        value = action.get("top_r", action.get("budget", self.top_r))
+        if torch.is_tensor(value):
+            if value.numel() == 0:
+                return self.top_r
+            value = float(value.detach().float().mean().cpu().item())
+        try:
+            return max(1, int(round(float(value))))
+        except (TypeError, ValueError):
+            return self.top_r
+
+    def _action_budget(
+        self,
+        action: Dict,
+        batch_size: int,
+        device: torch.device,
+    ) -> torch.Tensor:
+        value = action.get("budget", action.get("top_r", self.top_r))
+        if torch.is_tensor(value):
+            value = value.to(device=device, dtype=torch.float32).flatten()
+            if value.numel() == batch_size:
+                return value.round().clamp_min(1).long()
+            if value.numel() > 0:
+                scalar = int(round(float(value.mean().detach().cpu().item())))
+                return torch.full((batch_size,), max(1, scalar), dtype=torch.long, device=device)
+        try:
+            scalar = int(round(float(value)))
+        except (TypeError, ValueError):
+            scalar = self.top_r
+        return torch.full((batch_size,), max(1, scalar), dtype=torch.long, device=device)
+
+    def _subcode_bits(self, outputs: Dict[str, torch.Tensor], key: str, fallback: int) -> int:
+        value = outputs.get(key, fallback)
+        if torch.is_tensor(value):
+            if value.numel() == 0:
+                return int(fallback)
+            return max(1, int(value.detach().cpu().item()))
+        return max(1, int(value))
+
+    def _output_bool(self, outputs: Dict[str, torch.Tensor], key: str, default: bool = False) -> bool:
+        value = outputs.get(key, default)
+        if torch.is_tensor(value):
+            if value.numel() == 0:
+                return bool(default)
+            return bool(value.detach().cpu().item())
+        return bool(value)
+
     def _memory_valid_indices(self, memory, action: Dict) -> torch.Tensor:
         valid_mask = memory.u_valid
         if bool(action.get("use_routed_similarity", False)) and hasattr(memory, "u_s_valid") and hasattr(memory, "u_f_valid"):
@@ -1519,25 +1567,44 @@ class AgenticUnifiedContrastiveLoss(ContrastiveARFLoss):
             has_branch_memory = False
 
         if use_routed:
-            query_s = F.normalize(torch.cat([outputs["u_s_a"], outputs["u_s_b"]], dim=0).float(), dim=-1)
-            query_f = F.normalize(torch.cat([outputs["u_f_a"], outputs["u_f_b"]], dim=0).float(), dim=-1)
+            query_s = torch.cat([outputs["u_s_a"], outputs["u_s_b"]], dim=0).float()
+            query_f = torch.cat([outputs["u_f_a"], outputs["u_f_b"]], dim=0).float()
+            subcode_concat = self._output_bool(outputs, "use_subcode_concat", False)
+            semantic_bits = self._subcode_bits(outputs, "semantic_hash_bits", query_s.shape[-1])
+            temporal_bits = self._subcode_bits(outputs, "temporal_hash_bits", query_f.shape[-1])
             alpha_query = alpha[query_base]
             alpha_batch = alpha[candidate_base]
             alpha_pair = 0.5 * (alpha_query[:, None] + alpha_batch[None, :])
-            batch_logits = alpha_pair * (query_s @ query_s.t()) + (1.0 - alpha_pair) * (query_f @ query_f.t())
+            if subcode_concat:
+                sim_s_batch = (query_s @ query_s.t()) / float(max(1, semantic_bits))
+                sim_f_batch = (query_f @ query_f.t()) / float(max(1, temporal_bits))
+            else:
+                query_s_norm = F.normalize(query_s, dim=-1)
+                query_f_norm = F.normalize(query_f, dim=-1)
+                sim_s_batch = query_s_norm @ query_s_norm.t()
+                sim_f_batch = query_f_norm @ query_f_norm.t()
+            batch_logits = alpha_pair * sim_s_batch + (1.0 - alpha_pair) * sim_f_batch
 
             if has_branch_memory:
                 memory_s = memory.u_s_bank.index_select(0, valid_indices_mem).to(device=device, dtype=torch.float32)
                 memory_f = memory.u_f_bank.index_select(0, valid_indices_mem).to(device=device, dtype=torch.float32)
-                memory_s = F.normalize(memory_s, dim=-1)
-                memory_f = F.normalize(memory_f, dim=-1)
                 valid_indices = valid_indices_mem.to(device=device, dtype=torch.long)
                 if hasattr(memory, "route_alpha"):
                     alpha_memory = memory.route_alpha.index_select(0, valid_indices_mem).to(device=device, dtype=torch.float32)
                 else:
                     alpha_memory = torch.full((valid_indices.numel(),), 0.5, dtype=torch.float32, device=device)
                 alpha_mem_pair = 0.5 * (alpha_query[:, None] + alpha_memory[None, :])
-                memory_logits = alpha_mem_pair * (query_s @ memory_s.t()) + (1.0 - alpha_mem_pair) * (query_f @ memory_f.t())
+                if subcode_concat:
+                    sim_s_memory = (query_s @ memory_s.t()) / float(max(1, semantic_bits))
+                    sim_f_memory = (query_f @ memory_f.t()) / float(max(1, temporal_bits))
+                else:
+                    query_s_norm = F.normalize(query_s, dim=-1)
+                    query_f_norm = F.normalize(query_f, dim=-1)
+                    memory_s = F.normalize(memory_s, dim=-1)
+                    memory_f = F.normalize(memory_f, dim=-1)
+                    sim_s_memory = query_s_norm @ memory_s.t()
+                    sim_f_memory = query_f_norm @ memory_f.t()
+                memory_logits = alpha_mem_pair * sim_s_memory + (1.0 - alpha_mem_pair) * sim_f_memory
             else:
                 valid_indices = valid_indices_mem.to(device=device, dtype=torch.long)
                 memory_u = memory.u_bank.index_select(0, valid_indices_mem)
@@ -1563,6 +1630,8 @@ class AgenticUnifiedContrastiveLoss(ContrastiveARFLoss):
             "route_omega_std": omega.std(unbiased=False) if omega.numel() > 1 else omega.new_zeros(()),
             "route_enabled": torch.tensor(float(use_routed), device=device),
             "sample_weight_enabled": torch.tensor(float(bool(action.get("sample_weight_enabled", False))), device=device),
+            "semantic_bits": torch.tensor(float(self._subcode_bits(outputs, "semantic_hash_bits", 0)), device=device),
+            "temporal_bits": torch.tensor(float(self._subcode_bits(outputs, "temporal_hash_bits", 0)), device=device),
         }
         query_weight = omega[query_base].clamp_min(0.0)
         return batch_logits, memory_logits, valid_indices, {"metrics": metrics, "query_weight": query_weight}
@@ -1581,6 +1650,8 @@ class AgenticUnifiedContrastiveLoss(ContrastiveARFLoss):
         device = outputs["u_a"].device
         batch_size = outputs["u_a"].shape[0]
         action = self._agent_action(outputs)
+        trace_budget = self._action_budget(action, batch_size, device)
+        trace_top_r = float(trace_budget.float().mean().detach().cpu().item())
         valid_indices_mem = self._memory_valid_indices(memory, action)
         query_count = batch_size * 2
         query_base = torch.arange(query_count, device=device) % batch_size
@@ -1624,6 +1695,7 @@ class AgenticUnifiedContrastiveLoss(ContrastiveARFLoss):
             valid_indices,
             schedule,
             hard_mining_enabled,
+            trace_budget,
         )
         arf_b, hpos_b, hneg_b, targets_b, metrics_b = self._trace_masks_for_view(
             outputs,
@@ -1634,6 +1706,7 @@ class AgenticUnifiedContrastiveLoss(ContrastiveARFLoss):
             valid_indices,
             schedule,
             hard_mining_enabled,
+            trace_budget,
         )
         arf_mask = torch.cat([arf_a, arf_b], dim=0) & memory_candidate_mask
         hard_positive_mask = torch.cat([hpos_a, hpos_b], dim=0) & memory_candidate_mask
@@ -1649,14 +1722,18 @@ class AgenticUnifiedContrastiveLoss(ContrastiveARFLoss):
             source_weights.get("arf_missed_bonus", self.source_weight_missed_bonus)
         )
         hard_negative_weight = max(1.0, float(source_weights.get("hard_negative_weight", self.hard_negative_weight)))
+        if valid_indices.numel() > 0 and hasattr(memory, "edge_factor"):
+            edge_factor = memory.edge_factor(query_sample_ids, valid_indices, default=1.0).to(device=device, dtype=torch.float32)
+        else:
+            edge_factor = torch.ones(query_count, valid_indices.numel(), dtype=torch.float32, device=device)
 
         positive_weights = torch.zeros_like(logits, dtype=torch.float32)
         positive_weights[:, :query_count] += self._source_addition(view_mask, source_weight_view)
         positive_weights[:, :query_count] += self._source_addition(batch_neighbor_mask, source_weight_batch)
         if valid_indices.numel() > 0:
-            positive_weights[:, query_count:] += self._source_addition(memory_neighbor_mask, source_weight_memory)
-            positive_weights[:, query_count:] += self._source_addition(arf_mask, source_weight_arf)
-            positive_weights[:, query_count:] += self._source_addition(hard_positive_mask, source_weight_missed_bonus)
+            positive_weights[:, query_count:] += self._source_addition(memory_neighbor_mask, source_weight_memory) * edge_factor
+            positive_weights[:, query_count:] += self._source_addition(arf_mask, source_weight_arf) * edge_factor
+            positive_weights[:, query_count:] += self._source_addition(hard_positive_mask, source_weight_missed_bonus) * edge_factor
         positive_weights = torch.clamp(positive_weights, min=0.0, max=self.max_positive_weight)
         positive_weights = positive_weights * candidate_mask.float()
 
@@ -1681,6 +1758,10 @@ class AgenticUnifiedContrastiveLoss(ContrastiveARFLoss):
                 "route_omega_std": route_data["metrics"]["route_omega_std"],
                 "route_enabled": route_data["metrics"]["route_enabled"],
                 "sample_weight_enabled": route_data["metrics"]["sample_weight_enabled"],
+                "edge_factor_mean": zero,
+                "trace_top_r": torch.tensor(float(trace_top_r), device=device),
+                "semantic_bits": route_data["metrics"]["semantic_bits"],
+                "temporal_bits": route_data["metrics"]["temporal_bits"],
             }
 
         mask_value = -1e4 if logits.dtype in {torch.float16, torch.bfloat16} else -1e9
@@ -1725,6 +1806,12 @@ class AgenticUnifiedContrastiveLoss(ContrastiveARFLoss):
             "route_omega_std": route_data["metrics"]["route_omega_std"],
             "route_enabled": route_data["metrics"]["route_enabled"],
             "sample_weight_enabled": route_data["metrics"]["sample_weight_enabled"],
+            "edge_factor_mean": edge_factor[pos_active[:, query_count:]].mean()
+            if valid_indices.numel() > 0 and pos_active[:, query_count:].any()
+            else zero,
+            "trace_top_r": torch.tensor(float(trace_top_r), device=device),
+            "semantic_bits": route_data["metrics"]["semantic_bits"],
+            "temporal_bits": route_data["metrics"]["temporal_bits"],
         }
         return loss_value.to(dtype=outputs["u_a"].dtype), metrics
 
@@ -1761,17 +1848,10 @@ class AgenticUnifiedContrastiveLoss(ContrastiveARFLoss):
             schedule,
             hard_mining_enabled,
         )
-        action = self._agent_action(outputs)
-        if bool(action.get("update_feedback_graph", False)) and hasattr(memory, "update_feedback_edges"):
-            with torch.no_grad():
-                memory.update_feedback_edges(
-                    sample_indices,
-                    metrics["targets_a"],
-                    epoch=epoch,
-                    max_edges=int(action.get("edge_slots", 40)),
-                    posterior_momentum=float(action.get("edge_posterior_momentum", 0.80)),
-                    reliability_momentum=float(action.get("edge_reliability_momentum", 0.80)),
-                )
+        outputs["agent_feedback_targets"] = {
+            "targets_a": metrics["targets_a"],
+            "targets_b": metrics["targets_b"],
+        }
         component_quant = self.quantization(outputs["u_a"], outputs["u_b"])
         component_bit_balance = self.balance(outputs["u_a"], outputs["u_b"])
         loss_hash = (
@@ -1816,6 +1896,10 @@ class AgenticUnifiedContrastiveLoss(ContrastiveARFLoss):
             "metric_agentic_route_omega_std": metrics["route_omega_std"],
             "metric_agentic_routed_similarity": metrics["route_enabled"],
             "metric_agentic_sample_weighting": metrics["sample_weight_enabled"],
+            "metric_agentic_edge_factor": metrics["edge_factor_mean"],
+            "metric_agentic_trace_top_r": metrics["trace_top_r"],
+            "metric_agentic_semantic_bits": metrics["semantic_bits"],
+            "metric_agentic_temporal_bits": metrics["temporal_bits"],
             "metric_aucl_raw": component_agentic.detach(),
             "metric_aucl_pos_raw": metrics["batch_count"],
             "metric_aucl_pos_planned": metrics["arf_count"],
@@ -1923,6 +2007,10 @@ class PhasedAgenticUnifiedContrastiveLoss(AgenticUnifiedContrastiveLoss):
             hard_mining_enabled,
             source_weights=self._effective_source_weights(agentic_alpha),
         )
+        outputs["agent_feedback_targets"] = {
+            "targets_a": metrics["targets_a"],
+            "targets_b": metrics["targets_b"],
+        }
         component_quant = self.quantization(outputs["u_a"], outputs["u_b"])
         component_bit_balance = self.balance(outputs["u_a"], outputs["u_b"])
         loss_hash = (
@@ -1961,6 +2049,16 @@ class PhasedAgenticUnifiedContrastiveLoss(AgenticUnifiedContrastiveLoss):
             "metric_agentic_hard_positive_count": metrics["hard_positive_count"],
             "metric_agentic_hard_negative_count": metrics["hard_negative_count"],
             "metric_agentic_positive_weight_mean": metrics["positive_weight"],
+            "metric_agentic_route_alpha": metrics["route_alpha_mean"],
+            "metric_agentic_route_alpha_std": metrics["route_alpha_std"],
+            "metric_agentic_route_omega": metrics["route_omega_mean"],
+            "metric_agentic_route_omega_std": metrics["route_omega_std"],
+            "metric_agentic_routed_similarity": metrics["route_enabled"],
+            "metric_agentic_sample_weighting": metrics["sample_weight_enabled"],
+            "metric_agentic_edge_factor": metrics["edge_factor_mean"],
+            "metric_agentic_trace_top_r": metrics["trace_top_r"],
+            "metric_agentic_semantic_bits": metrics["semantic_bits"],
+            "metric_agentic_temporal_bits": metrics["temporal_bits"],
             "metric_agentic_mix_alpha": torch.tensor(float(agentic_alpha), device=device),
             "metric_stage1_keep_weight": torch.tensor(float(stage1_weight), device=device),
             "metric_arf_target_count": 0.5

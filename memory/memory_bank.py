@@ -46,12 +46,7 @@ def build_label_bank(dataset, device: torch.device) -> Optional[torch.Tensor]:
 
 
 class PlannerMemoryBank:
-    """Memory bank used by Planner Graph sanity logging.
-
-    Stage 2 does not use this bank for loss computation. It stores per-sample
-    non-parametric prototypes and the current fused representation so the graph
-    planner can compute top-M neighbor diagnostics on demand.
-    """
+    """Memory bank for planner state, routed hash codes, and feedback edges."""
 
     def __init__(
         self,
@@ -72,8 +67,8 @@ class PlannerMemoryBank:
         self.dyn_proto_bank = self._empty_bank(raw_dim)
         self.z_bank = self._empty_bank(z_dim)
         self.u_bank = self._empty_bank(hash_dim)
-        self.u_s_bank = self._empty_bank(hash_dim)
-        self.u_f_bank = self._empty_bank(hash_dim)
+        self.u_s_bank = self._empty_bank(0)
+        self.u_f_bank = self._empty_bank(0)
         self.sem_valid = torch.zeros(self.num_items, dtype=torch.bool, device=device)
         self.dyn_valid = torch.zeros(self.num_items, dtype=torch.bool, device=device)
         self.z_valid = torch.zeros(self.num_items, dtype=torch.bool, device=device)
@@ -119,10 +114,18 @@ class PlannerMemoryBank:
         if self.u_bank is not None and self.u_bank.shape[1] == int(dim):
             return
         self.u_bank = torch.zeros(self.num_items, int(dim), dtype=torch.float32, device=self.device)
-        self.u_s_bank = torch.zeros(self.num_items, int(dim), dtype=torch.float32, device=self.device)
-        self.u_f_bank = torch.zeros(self.num_items, int(dim), dtype=torch.float32, device=self.device)
         self.u_valid.zero_()
+
+    def _ensure_u_s_dim(self, dim: int):
+        if self.u_s_bank is not None and self.u_s_bank.shape[1] == int(dim):
+            return
+        self.u_s_bank = torch.zeros(self.num_items, int(dim), dtype=torch.float32, device=self.device)
         self.u_s_valid.zero_()
+
+    def _ensure_u_f_dim(self, dim: int):
+        if self.u_f_bank is not None and self.u_f_bank.shape[1] == int(dim):
+            return
+        self.u_f_bank = torch.zeros(self.num_items, int(dim), dtype=torch.float32, device=self.device)
         self.u_f_valid.zero_()
 
     def _update_code_bank(
@@ -219,9 +222,11 @@ class PlannerMemoryBank:
             u_proto = 0.5 * (u_a.detach().float().to(self.device) + u_b.detach().float().to(self.device))
             self._update_code_bank(self.u_bank, self.u_valid, indices, u_proto, self.u_momentum)
             if u_s_a is not None and u_s_b is not None:
+                self._ensure_u_s_dim(u_s_a.shape[-1])
                 u_s_proto = 0.5 * (u_s_a.detach().float().to(self.device) + u_s_b.detach().float().to(self.device))
                 self._update_code_bank(self.u_s_bank, self.u_s_valid, indices, u_s_proto, self.u_momentum)
             if u_f_a is not None and u_f_b is not None:
+                self._ensure_u_f_dim(u_f_a.shape[-1])
                 u_f_proto = 0.5 * (u_f_a.detach().float().to(self.device) + u_f_b.detach().float().to(self.device))
                 self._update_code_bank(self.u_f_bank, self.u_f_valid, indices, u_f_proto, self.u_momentum)
 
@@ -248,6 +253,7 @@ class PlannerMemoryBank:
         sample_indices: torch.Tensor,
         targets: dict,
         epoch: int,
+        targets_b: Optional[dict] = None,
         max_edges: int = 40,
         posterior_momentum: float = 0.80,
         reliability_momentum: float = 0.80,
@@ -266,6 +272,22 @@ class PlannerMemoryBank:
         actual_scores = targets.get("actual_scores", torch.ones_like(actual_indices, dtype=torch.float32))
         planned_scores = planned_scores.detach().float().to(self.device)
         actual_scores = actual_scores.detach().float().to(self.device)
+        if targets_b is not None:
+            planned_indices_b = targets_b.get("planned_indices", None)
+            actual_indices_b = targets_b.get("actual_indices", None)
+            if planned_indices_b is not None and actual_indices_b is not None:
+                planned_indices_b = planned_indices_b.detach().long().to(self.device)
+                actual_indices_b = actual_indices_b.detach().long().to(self.device)
+                planned_mask_b = targets_b.get("planned_mask", torch.ones_like(planned_indices_b, dtype=torch.bool))
+                actual_mask_b = targets_b.get("actual_mask", torch.ones_like(actual_indices_b, dtype=torch.bool))
+                planned_scores_b = targets_b.get("planned_scores", torch.ones_like(planned_indices_b, dtype=torch.float32))
+                actual_scores_b = targets_b.get("actual_scores", torch.ones_like(actual_indices_b, dtype=torch.float32))
+                planned_indices = torch.cat([planned_indices, planned_indices_b], dim=1)
+                actual_indices = torch.cat([actual_indices, actual_indices_b], dim=1)
+                planned_mask = torch.cat([planned_mask, planned_mask_b.detach().bool().to(self.device)], dim=1)
+                actual_mask = torch.cat([actual_mask, actual_mask_b.detach().bool().to(self.device)], dim=1)
+                planned_scores = torch.cat([planned_scores, planned_scores_b.detach().float().to(self.device)], dim=1)
+                actual_scores = torch.cat([actual_scores, actual_scores_b.detach().float().to(self.device)], dim=1)
 
         slots = max(int(max_edges), planned_indices.shape[1] + actual_indices.shape[1], 1)
         self._ensure_edge_slots(slots)
@@ -397,6 +419,55 @@ class PlannerMemoryBank:
             "memory_edge_decay": float(decay.mean().detach().cpu().item()),
             "memory_edge_stability": float(stability.detach().cpu().item()),
         }
+
+    def global_edge_stability(self) -> float:
+        if self.edge_indices is None or self.prev_edge_indices is None:
+            return 0.0
+        edge_mask = self.edge_indices >= 0
+        prev_mask = self.prev_edge_indices >= 0
+        active_rows = edge_mask.any(dim=1) | prev_mask.any(dim=1)
+        if not bool(active_rows.any().item()):
+            return 0.0
+        edge_indices = self.edge_indices[active_rows]
+        prev = self.prev_edge_indices[active_rows]
+        edge_mask = edge_mask[active_rows]
+        prev_mask = prev_mask[active_rows]
+        intersection = ((edge_indices.unsqueeze(-1) == prev.unsqueeze(1)) & edge_mask.unsqueeze(-1) & prev_mask.unsqueeze(1)).any(dim=-1)
+        inter_count = intersection.float().sum(dim=1)
+        union_count = edge_mask.float().sum(dim=1) + prev_mask.float().sum(dim=1) - inter_count
+        return float((inter_count / union_count.clamp_min(1.0)).mean().detach().cpu().item())
+
+    def edge_factor(
+        self,
+        anchor_indices: torch.Tensor,
+        candidate_indices: torch.Tensor,
+        default: float = 1.0,
+    ) -> torch.Tensor:
+        anchors = anchor_indices.detach().long().to(self.device)
+        candidates = candidate_indices.detach().long().to(self.device)
+        if candidates.numel() == 0:
+            return torch.empty(anchors.numel(), 0, dtype=torch.float32, device=self.device)
+        factors = torch.full(
+            (anchors.numel(), candidates.numel()),
+            float(default),
+            dtype=torch.float32,
+            device=self.device,
+        )
+        if self.edge_indices is None:
+            return factors
+        edge_indices = self.edge_indices.index_select(0, anchors)
+        edge_mask = edge_indices >= 0
+        if not bool(edge_mask.any().item()):
+            return factors
+        weight = self.edge_weight.index_select(0, anchors).clamp_min(0.0)
+        posterior = self.edge_posterior.index_select(0, anchors).clamp(0.0, 1.0)
+        reliability = self.edge_reliability.index_select(0, anchors).clamp(0.0, 1.0)
+        decay = self.edge_decay.index_select(0, anchors).clamp(0.0, 1.0)
+        edge_value = (weight * posterior * reliability * decay).masked_fill(~edge_mask, 0.0)
+        match = edge_indices.unsqueeze(1) == candidates.view(1, -1, 1)
+        matched = match.any(dim=-1)
+        matched_value = (match.float() * edge_value.unsqueeze(1)).max(dim=-1).values
+        return torch.where(matched, matched_value, factors)
 
     @property
     def sem_dyn_valid(self) -> torch.Tensor:

@@ -188,21 +188,6 @@ def train_one_epoch(
             if neighbor_indices is not None:
                 outputs["neighbor_indices"] = neighbor_indices[batch_indices_cpu].to(device, non_blocking=True)
             if planner_memory is not None and graph_planner is not None:
-                with torch.no_grad():
-                    planner_memory.update_batch(
-                        batch_indices_cpu,
-                        video.detach(),
-                        outputs["selected_indices"].detach(),
-                        outputs["z_a"].detach(),
-                        outputs["z_b"].detach(),
-                        epoch=epoch,
-                        u_a=outputs["u_a"].detach(),
-                        u_b=outputs["u_b"].detach(),
-                        u_s_a=outputs["u_s_a"].detach() if "u_s_a" in outputs else None,
-                        u_s_b=outputs["u_s_b"].detach() if "u_s_b" in outputs else None,
-                        u_f_a=outputs["u_f_a"].detach() if "u_f_a" in outputs else None,
-                        u_f_b=outputs["u_f_b"].detach() if "u_f_b" in outputs else None,
-                    )
                 outputs["planner_memory"] = planner_memory
                 outputs["graph_planner"] = graph_planner
             agent_action = {}
@@ -223,6 +208,40 @@ def train_one_epoch(
             nn.utils.clip_grad_norm_(list(model.parameters()) + list(criterion.parameters()), grad_clip)
         scaler.step(optimizer)
         scaler.update()
+
+        if planner_memory is not None and graph_planner is not None:
+            with torch.no_grad():
+                feedback_targets = outputs.get("agent_feedback_targets", {})
+                if (
+                    isinstance(agent_action, dict)
+                    and bool(agent_action.get("update_feedback_graph", False))
+                    and hasattr(planner_memory, "update_feedback_edges")
+                    and isinstance(feedback_targets, dict)
+                    and "targets_a" in feedback_targets
+                ):
+                    planner_memory.update_feedback_edges(
+                        batch_indices_cpu,
+                        feedback_targets["targets_a"],
+                        epoch=epoch,
+                        targets_b=feedback_targets.get("targets_b", None),
+                        max_edges=int(agent_action.get("edge_slots", 40)),
+                        posterior_momentum=float(agent_action.get("edge_posterior_momentum", 0.80)),
+                        reliability_momentum=float(agent_action.get("edge_reliability_momentum", 0.80)),
+                    )
+                planner_memory.update_batch(
+                    batch_indices_cpu,
+                    video.detach(),
+                    outputs["selected_indices"].detach(),
+                    outputs["z_a"].detach(),
+                    outputs["z_b"].detach(),
+                    epoch=epoch,
+                    u_a=outputs["u_a"].detach(),
+                    u_b=outputs["u_b"].detach(),
+                    u_s_a=outputs["u_s_a"].detach() if "u_s_a" in outputs else None,
+                    u_s_b=outputs["u_s_b"].detach() if "u_s_b" in outputs else None,
+                    u_f_a=outputs["u_f_a"].detach() if "u_f_a" in outputs else None,
+                    u_f_b=outputs["u_f_b"].detach() if "u_f_b" in outputs else None,
+                )
 
         planner_metrics = None
         if planner_memory is not None and graph_planner is not None:
@@ -703,7 +722,7 @@ def train_rf_clath(
                 )
             else:
                 no_improve_evals += 1
-            agent_eval_state = agent_controller.observe_eval(epoch, metrics, train_stats)
+            agent_eval_state = agent_controller.observe_eval(epoch, metrics, train_stats, planner_memory=planner_memory)
             if agent_controller.logs_agent_style:
                 logger.info(agent_controller.format_eval(epoch, metrics, agent_eval_state, best_map))
             if bool(agent_eval_state.get("agent_eval_stop", False)):

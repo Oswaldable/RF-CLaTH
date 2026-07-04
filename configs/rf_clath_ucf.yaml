@@ -143,8 +143,12 @@ agentic:
   policy:
     route_enabled: true
     use_routed_similarity: true
+    use_subcode_concat: true
+    semantic_hash_ratio: 0.5
     sample_weight_enabled: true
     update_feedback_graph: true
+    budget_min: 8
+    budget_max: 20
     alpha_default: 0.5
     alpha_kappa: 6.0
     alpha_bias: 0.0
@@ -166,7 +170,8 @@ agentic:
     min_memory_stability: 0.95
     gate_entropy_low: 0.05
     gate_entropy_high: 0.98
-    cost_weight: 0.0
+    horizon_windows: 3
+    cost_weight: 0.000001
     min_utility: 0.0
 
 arf_loss:

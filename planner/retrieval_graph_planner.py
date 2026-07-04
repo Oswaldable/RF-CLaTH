@@ -371,7 +371,15 @@ class RetrievalGraphPlanner:
         planned_indices = candidates[planned_local]
         planned_mask = torch.isfinite(planned_values)
 
-        actual_count = max(0, int(top_r)) if use_actual_trace else 0
+        if torch.is_tensor(top_r):
+            top_r_per_anchor = top_r.detach().long().to(memory.device).flatten().clamp_min(0)
+            if top_r_per_anchor.numel() != anchors.numel():
+                fill = int(top_r_per_anchor.float().mean().round().item()) if top_r_per_anchor.numel() > 0 else 0
+                top_r_per_anchor = torch.full((anchors.numel(),), max(0, fill), dtype=torch.long, device=memory.device)
+            actual_count = int(top_r_per_anchor.max().item()) if use_actual_trace else 0
+        else:
+            top_r_per_anchor = None
+            actual_count = max(0, int(top_r)) if use_actual_trace else 0
         if actual_count > 0:
             query = query_u.detach().float().to(memory.device)
             query_bits = torch.sign(query)
@@ -383,6 +391,9 @@ class RetrievalGraphPlanner:
             actual_values, actual_local = _topk(trace_sim, actual_count)
             actual_indices = candidates[actual_local]
             actual_mask = torch.isfinite(actual_values)
+            if top_r_per_anchor is not None:
+                ranks = torch.arange(actual_count, device=memory.device).unsqueeze(0)
+                actual_mask = actual_mask & (ranks < top_r_per_anchor.unsqueeze(1))
             actual_scores = p_final.gather(dim=1, index=actual_local)
         else:
             actual_indices = torch.empty(anchors.shape[0], 0, dtype=torch.long, device=memory.device)

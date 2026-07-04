@@ -149,7 +149,27 @@ class RetrievalFeedbackContentLateralTemporalHashing(nn.Module):
                 dropout=float(fusion_cfg.get("dropout", 0.1)),
                 gamma_init=float(fusion_cfg.get("gamma_init", 0.1)),
             )
-        self.hash_head = HashHead(self.hidden_dim, int(model_cfg.get("hash_bits", 64)))
+        self.hash_bits = int(model_cfg.get("hash_bits", 64))
+        agentic_policy_cfg = cfg.get("agentic", {}).get("policy", {})
+        self.use_subcode_concat = bool(agentic_policy_cfg.get("use_subcode_concat", True))
+        semantic_bits_cfg = agentic_policy_cfg.get("semantic_hash_bits", model_cfg.get("semantic_hash_bits", None))
+        temporal_bits_cfg = agentic_policy_cfg.get("temporal_hash_bits", model_cfg.get("temporal_hash_bits", None))
+        if semantic_bits_cfg is not None:
+            self.semantic_hash_bits = int(semantic_bits_cfg)
+            self.temporal_hash_bits = self.hash_bits - self.semantic_hash_bits
+        elif temporal_bits_cfg is not None:
+            self.temporal_hash_bits = int(temporal_bits_cfg)
+            self.semantic_hash_bits = self.hash_bits - self.temporal_hash_bits
+        else:
+            semantic_ratio = float(agentic_policy_cfg.get("semantic_hash_ratio", model_cfg.get("semantic_hash_ratio", 0.5)))
+            self.semantic_hash_bits = int(round(self.hash_bits * semantic_ratio))
+            self.temporal_hash_bits = self.hash_bits - self.semantic_hash_bits
+        self.semantic_hash_bits = max(1, min(self.hash_bits - 1, self.semantic_hash_bits))
+        self.temporal_hash_bits = self.hash_bits - self.semantic_hash_bits
+
+        self.hash_head = HashHead(self.hidden_dim, self.hash_bits)
+        self.semantic_hash_head = HashHead(self.hidden_dim, self.semantic_hash_bits)
+        self.temporal_hash_head = HashHead(self.hidden_dim, self.temporal_hash_bits)
 
     def _encode_input(self, video_or_features: torch.Tensor) -> torch.Tensor:
         if self.input_type == "frames":
@@ -280,12 +300,20 @@ class RetrievalFeedbackContentLateralTemporalHashing(nn.Module):
             z_b = self._fuse_or_bypass(h_s, h_f_b)
             h_s_a = h_s
             h_s_b = h_s
-        u_a = self.hash_head(z_a)
-        u_b = self.hash_head(z_b)
-        u_s_a = self.hash_head(h_s_a) if self.use_slow else torch.zeros_like(u_a)
-        u_s_b = self.hash_head(h_s_b) if self.use_slow else torch.zeros_like(u_b)
-        u_f_a = self.hash_head(h_f_a) if self.use_fast else torch.zeros_like(u_a)
-        u_f_b = self.hash_head(h_f_b) if self.use_fast else torch.zeros_like(u_b)
+        if self.use_subcode_concat:
+            u_s_a = self.semantic_hash_head(h_s_a) if self.use_slow else z_a.new_zeros(z_a.shape[0], self.semantic_hash_bits)
+            u_s_b = self.semantic_hash_head(h_s_b) if self.use_slow else z_b.new_zeros(z_b.shape[0], self.semantic_hash_bits)
+            u_f_a = self.temporal_hash_head(h_f_a) if self.use_fast else z_a.new_zeros(z_a.shape[0], self.temporal_hash_bits)
+            u_f_b = self.temporal_hash_head(h_f_b) if self.use_fast else z_b.new_zeros(z_b.shape[0], self.temporal_hash_bits)
+            u_a = torch.cat([u_s_a, u_f_a], dim=-1)
+            u_b = torch.cat([u_s_b, u_f_b], dim=-1)
+        else:
+            u_a = self.hash_head(z_a)
+            u_b = self.hash_head(z_b)
+            u_s_a = self.hash_head(h_s_a) if self.use_slow else torch.zeros_like(u_a)
+            u_s_b = self.hash_head(h_s_b) if self.use_slow else torch.zeros_like(u_b)
+            u_f_a = self.hash_head(h_f_a) if self.use_fast else torch.zeros_like(u_a)
+            u_f_b = self.hash_head(h_f_b) if self.use_fast else torch.zeros_like(u_b)
 
         outputs = {
             "h_s": h_s,
@@ -301,6 +329,9 @@ class RetrievalFeedbackContentLateralTemporalHashing(nn.Module):
             "u_s_b": u_s_b,
             "u_f_a": u_f_a,
             "u_f_b": u_f_b,
+            "semantic_hash_bits": torch.tensor(self.semantic_hash_bits, device=x.device),
+            "temporal_hash_bits": torch.tensor(self.temporal_hash_bits, device=x.device),
+            "use_subcode_concat": torch.tensor(self.use_subcode_concat, device=x.device),
             "selected_indices": selected_indices,
             "fast_indices": fast_indices,
             "slow_mask": slow_mask,
