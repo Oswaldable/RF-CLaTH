@@ -229,6 +229,7 @@ def train_one_epoch(
                         reliability_momentum=float(agent_action.get("edge_reliability_momentum", 0.80)),
                         edge_decay_gamma=float(agent_action.get("edge_decay_gamma", 0.98)),
                         old_edge_reserve_ratio=float(agent_action.get("old_edge_reserve_ratio", 0.25)),
+                        false_edge_reserve_ratio=float(agent_action.get("false_edge_reserve_ratio", 0.25)),
                     )
                 planner_memory.update_batch(
                     batch_indices_cpu,
@@ -649,6 +650,18 @@ def train_rf_clath(
         state = load_checkpoint(resume, model, optimizer, scheduler, criterion, map_location=str(use_device))
         start_epoch = int(state.get("epoch", 0)) + 1
         best_map = float(state.get("best_metric", 0.0))
+        if state.get("_optimizer_loaded") is False:
+            logger.warning(
+                "resumed model weights from %s but skipped optimizer state: %s",
+                resume,
+                state.get("_optimizer_load_error", "incompatible optimizer state"),
+            )
+        if state.get("_scheduler_loaded") is False:
+            logger.warning(
+                "resumed model weights from %s but skipped scheduler state: %s",
+                resume,
+                state.get("_scheduler_load_error", "incompatible scheduler state"),
+            )
         logger.info("resumed checkpoint=%s start_epoch=%d best_mAP=%.4f", resume, start_epoch, best_map)
 
     epochs = int(cfg.get("train", {}).get("epochs", 200))

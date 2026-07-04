@@ -172,6 +172,7 @@ agentic:
     edge_reliability_momentum: 0.80
     edge_decay_gamma: 0.98
     old_edge_reserve_ratio: 0.25
+    false_edge_reserve_ratio: 0.25
   stop_policy:
     enabled: true
     min_epoch: 50

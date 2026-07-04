@@ -1,3 +1,4 @@
+import warnings
 from pathlib import Path
 from typing import Optional
 
@@ -108,9 +109,40 @@ def load_checkpoint(
     state = torch.load(path, map_location=map_location or "cpu")
     _load_model_state_compatible(model, state["model"])
     if optimizer is not None and "optimizer" in state:
-        optimizer.load_state_dict(state["optimizer"])
+        try:
+            optimizer.load_state_dict(state["optimizer"])
+            state["_optimizer_loaded"] = True
+        except (RuntimeError, ValueError) as exc:
+            state["_optimizer_loaded"] = False
+            state["_optimizer_load_error"] = str(exc)
+            warnings.warn(
+                "Skipped optimizer state while loading checkpoint because it is incompatible "
+                "with the current model parameters. Model weights were loaded.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
     if scheduler is not None and "scheduler" in state:
-        scheduler.load_state_dict(state["scheduler"])
+        if optimizer is not None and "optimizer" in state and not state.get("_optimizer_loaded", False):
+            state["_scheduler_loaded"] = False
+            state["_scheduler_load_error"] = "optimizer state was skipped"
+            warnings.warn(
+                "Skipped scheduler state because optimizer state was not restored.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+        else:
+            try:
+                scheduler.load_state_dict(state["scheduler"])
+                state["_scheduler_loaded"] = True
+            except (RuntimeError, ValueError) as exc:
+                state["_scheduler_loaded"] = False
+                state["_scheduler_load_error"] = str(exc)
+                warnings.warn(
+                    "Skipped scheduler state while loading checkpoint because it is incompatible "
+                    "with the current optimizer.",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
     if criterion is not None and "criterion" in state:
         criterion.load_state_dict(state["criterion"], strict=False)
     return state

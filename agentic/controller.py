@@ -79,6 +79,7 @@ class AgenticTrainingController:
         self.edge_reliability_momentum = float(policy_cfg.get("edge_reliability_momentum", 0.80))
         self.edge_decay_gamma = float(policy_cfg.get("edge_decay_gamma", 0.98))
         self.old_edge_reserve_ratio = float(policy_cfg.get("old_edge_reserve_ratio", 0.25))
+        self.false_edge_reserve_ratio = float(policy_cfg.get("false_edge_reserve_ratio", 0.25))
 
         self.source_weight_view = float(source_cfg.get("view", 1.0))
         self.source_weight_batch = float(source_cfg.get("batch_neighbor", 0.75))
@@ -183,6 +184,7 @@ class AgenticTrainingController:
             "edge_reliability_momentum": self.edge_reliability_momentum,
             "edge_decay_gamma": self.edge_decay_gamma,
             "old_edge_reserve_ratio": self.old_edge_reserve_ratio,
+            "false_edge_reserve_ratio": self.false_edge_reserve_ratio,
             "alpha": alpha,
             "omega": omega,
             "budget": budget,
@@ -266,10 +268,13 @@ class AgenticTrainingController:
             f"false={_metric(losses, 'metric_arf_false_ratio'):.3f} "
             f"hpos={_metric(losses, 'metric_agentic_hard_positive_count'):.1f} "
             f"hneg={_metric(losses, 'metric_agentic_hard_negative_count'):.1f} "
-            f"edge={_metric(losses, 'metric_agentic_edge_factor'):.3f}) "
+            f"false_mem={_metric(losses, 'metric_agentic_persistent_false_count'):.1f} "
+            f"edge={_metric(losses, 'metric_agentic_edge_factor'):.3f} "
+            f"false_edge={_metric(losses, 'metric_agentic_false_edge_factor'):.3f}) "
             f"memory(valid={_metric(planner_metrics, 'planner_valid_final', _metric(action_metrics, 'agent_obs_valid')):.3f} "
             f"edge_p={_metric(memory_metrics, 'memory_edge_posterior'):.3f} "
             f"edge_r={_metric(memory_metrics, 'memory_edge_reliability'):.3f} "
+            f"edge_false={_metric(memory_metrics, 'memory_edge_false_ratio'):.3f} "
             f"stable={_metric(memory_metrics, 'memory_edge_stability'):.3f}) "
             f"adapt(loss={_metric(losses, 'loss'):.4f} "
             f"aucl={_metric(losses, 'component_agentic_contrastive', _metric(losses, 'loss_semantic')):.4f} "
@@ -295,9 +300,12 @@ class AgenticTrainingController:
             f"missed={stats.get('metric_arf_missed_ratio', 0.0):.3f} "
             f"false={stats.get('metric_arf_false_ratio', 0.0):.3f} "
             f"overlap={stats.get('metric_arf_actual_overlap', 0.0):.3f} "
-            f"edge={stats.get('metric_agentic_edge_factor', 0.0):.3f}) "
+            f"false_mem={stats.get('metric_agentic_persistent_false_count', 0.0):.1f} "
+            f"edge={stats.get('metric_agentic_edge_factor', 0.0):.3f} "
+            f"false_edge={stats.get('metric_agentic_false_edge_factor', 0.0):.3f}) "
             f"memory(edge_p={stats.get('memory_edge_posterior', 0.0):.3f} "
             f"edge_r={stats.get('memory_edge_reliability', 0.0):.3f} "
+            f"edge_false={stats.get('memory_edge_false_ratio', 0.0):.3f} "
             f"stable={stats.get('memory_edge_stability', 0.0):.3f}) "
             f"adapt(loss={stats.get('loss', 0.0):.4f} aucl={stats.get('component_agentic_contrastive', stats.get('loss_semantic', 0.0)):.4f} "
             f"hash={stats.get('loss_hash', 0.0):.4f})"

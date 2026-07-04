@@ -1816,6 +1816,12 @@ class AgenticUnifiedContrastiveLoss(ContrastiveARFLoss):
                 dtype=torch.float32,
                 device=device,
             )
+        persistent_false_mask = false_edge_factor > (float(self.false_edge_factor_default) + 1e-6)
+        current_feedback_positive_mask = arf_mask | hard_positive_mask
+        if valid_indices.numel() > 0:
+            memory_neighbor_mask = memory_neighbor_mask & (
+                (~persistent_false_mask) | current_feedback_positive_mask
+            )
 
         positive_weights = torch.zeros_like(logits, dtype=torch.float32)
         positive_weights[:, :query_count] += self._source_addition(view_mask, source_weight_view)
@@ -1854,6 +1860,7 @@ class AgenticUnifiedContrastiveLoss(ContrastiveARFLoss):
                 "sample_weight_enabled": route_data["metrics"]["sample_weight_enabled"],
                 "edge_factor_mean": zero,
                 "false_edge_factor_mean": zero,
+                "persistent_false_count": zero,
                 "trace_top_r": torch.tensor(float(trace_top_r), device=device),
                 "semantic_bits": route_data["metrics"]["semantic_bits"],
                 "temporal_bits": route_data["metrics"]["temporal_bits"],
@@ -1865,9 +1872,9 @@ class AgenticUnifiedContrastiveLoss(ContrastiveARFLoss):
             denom_bonus = torch.zeros_like(logits)
             hard_negative_scale = hard_negative_feedback_weight * float(hard_negative_weight)
             hard_negative_scale = hard_negative_scale.clamp_min(1.0)
-            persistent_false_mask = false_edge_factor > (float(self.false_edge_factor_default) + 1e-6)
-            positive_memory_active = positive_weights[:, query_count:] > 0
-            denominator_hard_mask = hard_negative_mask | (persistent_false_mask & (~positive_memory_active))
+            denominator_hard_mask = hard_negative_mask | (
+                persistent_false_mask & (~current_feedback_positive_mask)
+            )
             denominator_scale = torch.maximum(hard_negative_scale, false_edge_factor).clamp_min(1.0)
             denom_bonus[:, query_count:] = denominator_hard_mask.float() * torch.log(denominator_scale)
             denom_logits = denom_logits + denom_bonus
@@ -1898,6 +1905,11 @@ class AgenticUnifiedContrastiveLoss(ContrastiveARFLoss):
             if valid_indices.numel() > 0 and source_weight_missed_bonus > 0
             else zero,
             "hard_negative_count": hard_negative_mask.float().sum(dim=1).mean()
+            if valid_indices.numel() > 0
+            else zero,
+            "persistent_false_count": (
+                persistent_false_mask & (~current_feedback_positive_mask)
+            ).float().sum(dim=1).mean()
             if valid_indices.numel() > 0
             else zero,
             "positive_weight": positive_weights[pos_active].mean() if pos_active.any() else zero,
@@ -1993,6 +2005,7 @@ class AgenticUnifiedContrastiveLoss(ContrastiveARFLoss):
             "metric_agentic_pos_arf": metrics["arf_count"],
             "metric_agentic_hard_positive_count": metrics["hard_positive_count"],
             "metric_agentic_hard_negative_count": metrics["hard_negative_count"],
+            "metric_agentic_persistent_false_count": metrics["persistent_false_count"],
             "metric_agentic_positive_weight_mean": metrics["positive_weight"],
             "metric_agentic_route_alpha": metrics["route_alpha_mean"],
             "metric_agentic_route_alpha_std": metrics["route_alpha_std"],
@@ -2153,6 +2166,7 @@ class PhasedAgenticUnifiedContrastiveLoss(AgenticUnifiedContrastiveLoss):
             "metric_agentic_pos_arf": metrics["arf_count"],
             "metric_agentic_hard_positive_count": metrics["hard_positive_count"],
             "metric_agentic_hard_negative_count": metrics["hard_negative_count"],
+            "metric_agentic_persistent_false_count": metrics["persistent_false_count"],
             "metric_agentic_positive_weight_mean": metrics["positive_weight"],
             "metric_agentic_route_alpha": metrics["route_alpha_mean"],
             "metric_agentic_route_alpha_std": metrics["route_alpha_std"],
