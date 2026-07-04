@@ -227,6 +227,7 @@ def train_one_epoch(
                         max_edges=int(agent_action.get("edge_slots", 40)),
                         posterior_momentum=float(agent_action.get("edge_posterior_momentum", 0.80)),
                         reliability_momentum=float(agent_action.get("edge_reliability_momentum", 0.80)),
+                        edge_decay_gamma=float(agent_action.get("edge_decay_gamma", 0.98)),
                     )
                 planner_memory.update_batch(
                     batch_indices_cpu,

@@ -167,7 +167,7 @@ class RetrievalFeedbackContentLateralTemporalHashing(nn.Module):
         self.semantic_hash_bits = max(1, min(self.hash_bits - 1, self.semantic_hash_bits))
         self.temporal_hash_bits = self.hash_bits - self.semantic_hash_bits
 
-        self.hash_head = HashHead(self.hidden_dim, self.hash_bits)
+        self.hash_head = None if self.use_subcode_concat else HashHead(self.hidden_dim, self.hash_bits)
         self.semantic_hash_head = HashHead(self.hidden_dim, self.semantic_hash_bits)
         self.temporal_hash_head = HashHead(self.hidden_dim, self.temporal_hash_bits)
 
@@ -308,6 +308,8 @@ class RetrievalFeedbackContentLateralTemporalHashing(nn.Module):
             u_a = torch.cat([u_s_a, u_f_a], dim=-1)
             u_b = torch.cat([u_s_b, u_f_b], dim=-1)
         else:
+            if self.hash_head is None:
+                raise RuntimeError("Full hash head is unavailable when use_subcode_concat=true.")
             u_a = self.hash_head(z_a)
             u_b = self.hash_head(z_b)
             u_s_a = self.hash_head(h_s_a) if self.use_slow else torch.zeros_like(u_a)
@@ -348,7 +350,7 @@ class RetrievalFeedbackContentLateralTemporalHashing(nn.Module):
         self.eval()
         out = self.forward(video_or_features, deterministic=True, return_one_view=True)
         u = out["u_a"]
-        b = self.hash_head.binarize(u, binary_format=binary_format)
+        b = HashHead.binarize(u, binary_format=binary_format)
         out["soft_code"] = u
         out["binary_code"] = b
         if was_training:

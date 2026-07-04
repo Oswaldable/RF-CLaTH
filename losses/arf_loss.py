@@ -1368,6 +1368,8 @@ class AgenticUnifiedContrastiveLoss(ContrastiveARFLoss):
         self.edge_factor_boost = float(agentic_cfg.get("edge_factor_boost", 1.0))
         self.edge_factor_min = float(agentic_cfg.get("edge_factor_min", 1.0))
         self.edge_factor_max = float(agentic_cfg.get("edge_factor_max", self.max_positive_weight))
+        policy_cfg = cfg.get("agentic", {}).get("policy", {})
+        self.edge_decay_gamma = float(agentic_cfg.get("edge_decay_gamma", policy_cfg.get("edge_decay_gamma", 0.98)))
 
     def _source_addition(self, mask: torch.Tensor, weight: float) -> torch.Tensor:
         if weight <= 0 or mask.numel() == 0:
@@ -1425,6 +1427,23 @@ class AgenticUnifiedContrastiveLoss(ContrastiveARFLoss):
         masked = target_indices.long().masked_fill(~target_mask, -1)
         return (masked.unsqueeze(-1) == valid_indices.view(1, 1, -1)).any(dim=1)
 
+    def _target_column_weights(
+        self,
+        target_indices: torch.Tensor,
+        target_mask: torch.Tensor,
+        target_weights: torch.Tensor,
+        valid_indices: torch.Tensor,
+        default: float = 1.0,
+    ) -> torch.Tensor:
+        if valid_indices.numel() == 0 or target_indices.numel() == 0:
+            return torch.empty(target_indices.shape[0], valid_indices.shape[0], dtype=torch.float32, device=target_indices.device)
+        masked_indices = target_indices.long().masked_fill(~target_mask, -1)
+        masked_weights = target_weights.float().masked_fill(~target_mask, 0.0)
+        match = masked_indices.unsqueeze(-1) == valid_indices.view(1, 1, -1)
+        matched = match.any(dim=1)
+        weights = (match.float() * masked_weights.unsqueeze(-1)).max(dim=1).values
+        return torch.where(matched, weights.clamp_min(0.0), torch.full_like(weights, float(default)))
+
     def _trace_masks_for_view(
         self,
         outputs: Dict[str, torch.Tensor],
@@ -1436,7 +1455,16 @@ class AgenticUnifiedContrastiveLoss(ContrastiveARFLoss):
         schedule: Dict[str, float | bool],
         hard_mining_enabled: bool,
         top_r,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Dict[str, torch.Tensor], Dict[str, torch.Tensor]]:
+    ) -> Tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        Dict[str, torch.Tensor],
+        Dict[str, torch.Tensor],
+    ]:
         device = outputs[view_key].device
         targets = planner.arf_trace_targets(
             memory,
@@ -1458,9 +1486,13 @@ class AgenticUnifiedContrastiveLoss(ContrastiveARFLoss):
             hard_mining_enabled=hard_mining_enabled,
         )
         target_indices = targets["target_indices"].to(device)
+        target_weights = targets["target_weights"].to(device)
         arf_cols = self._target_columns(target_indices, positive_mask.to(device), valid_indices)
         hard_pos_cols = self._target_columns(target_indices, hard_positive_mask.to(device), valid_indices)
         hard_neg_cols = self._target_columns(target_indices, hard_negative_mask.to(device), valid_indices)
+        arf_weights = self._target_column_weights(target_indices, positive_mask.to(device), target_weights, valid_indices)
+        hard_pos_weights = self._target_column_weights(target_indices, hard_positive_mask.to(device), target_weights, valid_indices)
+        hard_neg_weights = self._target_column_weights(target_indices, hard_negative_mask.to(device), target_weights, valid_indices)
         zero = torch.zeros((), device=device)
         target_scores = targets["target_scores"].to(device)
         metrics = {
@@ -1470,8 +1502,11 @@ class AgenticUnifiedContrastiveLoss(ContrastiveARFLoss):
             else zero,
             "hard_positive_count": hard_positive_mask.float().sum(dim=1).mean() if hard_positive_mask.numel() > 0 else zero,
             "hard_negative_count": hard_negative_mask.float().sum(dim=1).mean() if hard_negative_mask.numel() > 0 else zero,
+            "feedback_weight_mean": target_weights[targets["target_mask"].to(device)].mean()
+            if target_weights.numel() > 0 and targets["target_mask"].to(device).any()
+            else zero,
         }
-        return arf_cols, hard_pos_cols, hard_neg_cols, targets, metrics
+        return arf_cols, hard_pos_cols, hard_neg_cols, arf_weights, hard_pos_weights, hard_neg_weights, targets, metrics
 
     def _agent_action(self, outputs: Dict[str, torch.Tensor]) -> Dict:
         action = outputs.get("agent_action", {})
@@ -1522,6 +1557,16 @@ class AgenticUnifiedContrastiveLoss(ContrastiveARFLoss):
         except (TypeError, ValueError):
             scalar = self.top_r
         return torch.full((batch_size,), max(1, scalar), dtype=torch.long, device=device)
+
+    def _current_epoch_value(self, outputs: Dict[str, torch.Tensor]) -> int | None:
+        epoch = outputs.get("epoch", None)
+        if epoch is None:
+            return None
+        if torch.is_tensor(epoch):
+            if epoch.numel() == 0:
+                return None
+            return int(epoch.detach().cpu().item())
+        return int(epoch)
 
     def _subcode_bits(self, outputs: Dict[str, torch.Tensor], key: str, fallback: int) -> int:
         value = outputs.get(key, fallback)
@@ -1690,7 +1735,7 @@ class AgenticUnifiedContrastiveLoss(ContrastiveARFLoss):
         memory_neighbor_mask = self._memory_neighbor_mask(sample_indices, neighbor_indices, query_base, valid_indices)
         memory_neighbor_mask = memory_neighbor_mask & memory_candidate_mask
 
-        arf_a, hpos_a, hneg_a, targets_a, metrics_a = self._trace_masks_for_view(
+        arf_a, hpos_a, hneg_a, arf_w_a, hpos_w_a, hneg_w_a, targets_a, metrics_a = self._trace_masks_for_view(
             outputs,
             "u_a",
             memory,
@@ -1701,7 +1746,7 @@ class AgenticUnifiedContrastiveLoss(ContrastiveARFLoss):
             hard_mining_enabled,
             trace_budget,
         )
-        arf_b, hpos_b, hneg_b, targets_b, metrics_b = self._trace_masks_for_view(
+        arf_b, hpos_b, hneg_b, arf_w_b, hpos_w_b, hneg_w_b, targets_b, metrics_b = self._trace_masks_for_view(
             outputs,
             "u_b",
             memory,
@@ -1715,6 +1760,9 @@ class AgenticUnifiedContrastiveLoss(ContrastiveARFLoss):
         arf_mask = torch.cat([arf_a, arf_b], dim=0) & memory_candidate_mask
         hard_positive_mask = torch.cat([hpos_a, hpos_b], dim=0) & memory_candidate_mask
         hard_negative_mask = torch.cat([hneg_a, hneg_b], dim=0) & memory_candidate_mask
+        arf_weight = torch.cat([arf_w_a, arf_w_b], dim=0).to(device=device, dtype=torch.float32)
+        hard_positive_weight = torch.cat([hpos_w_a, hpos_w_b], dim=0).to(device=device, dtype=torch.float32)
+        hard_negative_feedback_weight = torch.cat([hneg_w_a, hneg_w_b], dim=0).to(device=device, dtype=torch.float32)
 
         action_weights = action.get("source_weights", {}) if isinstance(action.get("source_weights", {}), dict) else {}
         source_weights = source_weights or action_weights
@@ -1734,6 +1782,8 @@ class AgenticUnifiedContrastiveLoss(ContrastiveARFLoss):
                 boost_scale=self.edge_factor_boost,
                 min_factor=self.edge_factor_min,
                 max_factor=self.edge_factor_max,
+                current_epoch=self._current_epoch_value(outputs),
+                edge_decay_gamma=self.edge_decay_gamma,
             ).to(device=device, dtype=torch.float32)
         else:
             edge_factor = torch.full(
@@ -1748,8 +1798,12 @@ class AgenticUnifiedContrastiveLoss(ContrastiveARFLoss):
         positive_weights[:, :query_count] += self._source_addition(batch_neighbor_mask, source_weight_batch)
         if valid_indices.numel() > 0:
             positive_weights[:, query_count:] += self._source_addition(memory_neighbor_mask, source_weight_memory) * edge_factor
-            positive_weights[:, query_count:] += self._source_addition(arf_mask, source_weight_arf) * edge_factor
-            positive_weights[:, query_count:] += self._source_addition(hard_positive_mask, source_weight_missed_bonus) * edge_factor
+            positive_weights[:, query_count:] += self._source_addition(arf_mask, source_weight_arf) * edge_factor * arf_weight
+            positive_weights[:, query_count:] += (
+                self._source_addition(hard_positive_mask, source_weight_missed_bonus)
+                * edge_factor
+                * hard_positive_weight
+            )
         positive_weights = torch.clamp(positive_weights, min=0.0, max=self.max_positive_weight)
         positive_weights = positive_weights * candidate_mask.float()
 
@@ -1782,9 +1836,11 @@ class AgenticUnifiedContrastiveLoss(ContrastiveARFLoss):
 
         mask_value = -1e4 if logits.dtype in {torch.float16, torch.bfloat16} else -1e9
         denom_logits = logits.masked_fill(~candidate_mask, mask_value)
-        if hard_negative_weight > 1.0 and valid_indices.numel() > 0:
+        if valid_indices.numel() > 0:
             denom_bonus = torch.zeros_like(logits)
-            denom_bonus[:, query_count:] = hard_negative_mask.float() * math.log(hard_negative_weight)
+            hard_negative_scale = hard_negative_feedback_weight * float(hard_negative_weight)
+            hard_negative_scale = hard_negative_scale.clamp_min(1.0)
+            denom_bonus[:, query_count:] = hard_negative_mask.float() * torch.log(hard_negative_scale)
             denom_logits = denom_logits + denom_bonus
         positive_logits = logits + torch.log(positive_weights.clamp_min(1e-12))
         positive_logits = positive_logits.masked_fill(positive_weights <= 0, mask_value)
@@ -1813,7 +1869,7 @@ class AgenticUnifiedContrastiveLoss(ContrastiveARFLoss):
             if valid_indices.numel() > 0 and source_weight_missed_bonus > 0
             else zero,
             "hard_negative_count": hard_negative_mask.float().sum(dim=1).mean()
-            if valid_indices.numel() > 0 and hard_negative_weight > 1.0
+            if valid_indices.numel() > 0
             else zero,
             "positive_weight": positive_weights[pos_active].mean() if pos_active.any() else zero,
             "route_alpha_mean": route_data["metrics"]["route_alpha_mean"],

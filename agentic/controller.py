@@ -77,6 +77,7 @@ class AgenticTrainingController:
         self.edge_slots = int(policy_cfg.get("edge_slots", 40))
         self.edge_posterior_momentum = float(policy_cfg.get("edge_posterior_momentum", 0.80))
         self.edge_reliability_momentum = float(policy_cfg.get("edge_reliability_momentum", 0.80))
+        self.edge_decay_gamma = float(policy_cfg.get("edge_decay_gamma", 0.98))
 
         self.source_weight_view = float(source_cfg.get("view", 1.0))
         self.source_weight_batch = float(source_cfg.get("batch_neighbor", 0.75))
@@ -179,6 +180,7 @@ class AgenticTrainingController:
             "edge_slots": self.edge_slots,
             "edge_posterior_momentum": self.edge_posterior_momentum,
             "edge_reliability_momentum": self.edge_reliability_momentum,
+            "edge_decay_gamma": self.edge_decay_gamma,
             "alpha": alpha,
             "omega": omega,
             "budget": budget,
