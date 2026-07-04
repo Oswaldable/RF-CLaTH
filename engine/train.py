@@ -67,6 +67,30 @@ def build_scheduler(optimizer, cfg: Dict):
     return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_lambda)
 
 
+def align_scheduler_to_epoch(scheduler, epoch: int):
+    epoch = max(0, int(epoch))
+    if scheduler is None or epoch <= 0:
+        return
+    if hasattr(scheduler, "lr_lambdas") and hasattr(scheduler, "base_lrs"):
+        lrs = []
+        for group, base_lr, lr_lambda in zip(
+            scheduler.optimizer.param_groups,
+            scheduler.base_lrs,
+            scheduler.lr_lambdas,
+        ):
+            lr = float(base_lr) * float(lr_lambda(epoch))
+            group["lr"] = lr
+            lrs.append(lr)
+        scheduler.last_epoch = epoch
+        scheduler._last_lr = lrs
+        return
+    try:
+        scheduler.step(epoch)
+    except TypeError:
+        for _ in range(epoch):
+            scheduler.step()
+
+
 def build_criterion(cfg: Dict) -> nn.Module:
     objective = str(
         cfg.get("training", {}).get(
@@ -657,10 +681,15 @@ def train_rf_clath(
                 state.get("_optimizer_load_error", "incompatible optimizer state"),
             )
         if state.get("_scheduler_loaded") is False:
+            align_epoch = max(0, start_epoch - 1)
+            align_scheduler_to_epoch(scheduler, align_epoch)
             logger.warning(
-                "resumed model weights from %s but skipped scheduler state: %s",
+                "resumed model weights from %s but skipped scheduler state: %s; "
+                "aligned new scheduler to epoch=%d lr=%s",
                 resume,
                 state.get("_scheduler_load_error", "incompatible scheduler state"),
+                align_epoch,
+                [group.get("lr", None) for group in optimizer.param_groups],
             )
         logger.info("resumed checkpoint=%s start_epoch=%d best_mAP=%.4f", resume, start_epoch, best_map)
 

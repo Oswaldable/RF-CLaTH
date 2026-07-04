@@ -1817,10 +1817,15 @@ class AgenticUnifiedContrastiveLoss(ContrastiveARFLoss):
                 device=device,
             )
         persistent_false_mask = false_edge_factor > (float(self.false_edge_factor_default) + 1e-6)
-        current_feedback_positive_mask = arf_mask | hard_positive_mask
+        current_feedback_positive_mask = torch.zeros_like(arf_mask)
+        if source_weight_arf > 0:
+            current_feedback_positive_mask = current_feedback_positive_mask | arf_mask
+        if source_weight_missed_bonus > 0:
+            current_feedback_positive_mask = current_feedback_positive_mask | hard_positive_mask
+        memory_negative_block_mask = hard_negative_mask | persistent_false_mask
         if valid_indices.numel() > 0:
             memory_neighbor_mask = memory_neighbor_mask & (
-                (~persistent_false_mask) | current_feedback_positive_mask
+                (~memory_negative_block_mask) | current_feedback_positive_mask
             )
 
         positive_weights = torch.zeros_like(logits, dtype=torch.float32)
@@ -1872,9 +1877,7 @@ class AgenticUnifiedContrastiveLoss(ContrastiveARFLoss):
             denom_bonus = torch.zeros_like(logits)
             hard_negative_scale = hard_negative_feedback_weight * float(hard_negative_weight)
             hard_negative_scale = hard_negative_scale.clamp_min(1.0)
-            denominator_hard_mask = hard_negative_mask | (
-                persistent_false_mask & (~current_feedback_positive_mask)
-            )
+            denominator_hard_mask = memory_negative_block_mask & (~current_feedback_positive_mask)
             denominator_scale = torch.maximum(hard_negative_scale, false_edge_factor).clamp_min(1.0)
             denom_bonus[:, query_count:] = denominator_hard_mask.float() * torch.log(denominator_scale)
             denom_logits = denom_logits + denom_bonus
@@ -1908,7 +1911,7 @@ class AgenticUnifiedContrastiveLoss(ContrastiveARFLoss):
             if valid_indices.numel() > 0
             else zero,
             "persistent_false_count": (
-                persistent_false_mask & (~current_feedback_positive_mask)
+                memory_negative_block_mask & (~current_feedback_positive_mask)
             ).float().sum(dim=1).mean()
             if valid_indices.numel() > 0
             else zero,

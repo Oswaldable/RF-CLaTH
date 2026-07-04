@@ -108,21 +108,28 @@ def load_checkpoint(
 ):
     state = torch.load(path, map_location=map_location or "cpu")
     _load_model_state_compatible(model, state["model"])
-    if optimizer is not None and "optimizer" in state:
-        try:
-            optimizer.load_state_dict(state["optimizer"])
-            state["_optimizer_loaded"] = True
-        except (RuntimeError, ValueError) as exc:
+    if optimizer is not None:
+        if "optimizer" in state:
+            try:
+                optimizer.load_state_dict(state["optimizer"])
+                state["_optimizer_loaded"] = True
+            except (RuntimeError, ValueError) as exc:
+                state["_optimizer_loaded"] = False
+                state["_optimizer_load_error"] = str(exc)
+                warnings.warn(
+                    "Skipped optimizer state while loading checkpoint because it is incompatible "
+                    "with the current model parameters. Model weights were loaded.",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
+        else:
             state["_optimizer_loaded"] = False
-            state["_optimizer_load_error"] = str(exc)
-            warnings.warn(
-                "Skipped optimizer state while loading checkpoint because it is incompatible "
-                "with the current model parameters. Model weights were loaded.",
-                RuntimeWarning,
-                stacklevel=2,
-            )
-    if scheduler is not None and "scheduler" in state:
-        if optimizer is not None and "optimizer" in state and not state.get("_optimizer_loaded", False):
+            state["_optimizer_load_error"] = "checkpoint has no optimizer state"
+    if scheduler is not None:
+        if "scheduler" not in state:
+            state["_scheduler_loaded"] = False
+            state["_scheduler_load_error"] = "checkpoint has no scheduler state"
+        elif optimizer is not None and "optimizer" in state and not state.get("_optimizer_loaded", False):
             state["_scheduler_loaded"] = False
             state["_scheduler_load_error"] = "optimizer state was skipped"
             warnings.warn(
