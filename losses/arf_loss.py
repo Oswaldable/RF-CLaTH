@@ -501,7 +501,7 @@ class ContrastiveARFLoss(HybridARFLoss):
         hard_negative_mask = torch.zeros_like(target_mask)
         if hard_mining_enabled:
             hard_negative_mask = in_actual & (~in_planned) & (~positive_mask)
-        hard_positive_mask = missed_positive_mask & positive_mask
+        hard_positive_mask = missed_positive_mask
         return positive_mask & target_mask, hard_positive_mask & target_mask, hard_negative_mask & target_mask
 
     def _memory_info_nce(
@@ -1364,6 +1364,10 @@ class AgenticUnifiedContrastiveLoss(ContrastiveARFLoss):
         self.source_weight_arf = float(source_cfg.get("arf_planned", 0.25))
         self.source_weight_missed_bonus = float(source_cfg.get("arf_missed_bonus", 0.25))
         self.hard_negative_weight = max(1.0, float(agentic_cfg.get("hard_negative_weight", 1.25)))
+        self.edge_factor_default = float(agentic_cfg.get("edge_factor_default", 1.0))
+        self.edge_factor_boost = float(agentic_cfg.get("edge_factor_boost", 1.0))
+        self.edge_factor_min = float(agentic_cfg.get("edge_factor_min", 1.0))
+        self.edge_factor_max = float(agentic_cfg.get("edge_factor_max", self.max_positive_weight))
 
     def _source_addition(self, mask: torch.Tensor, weight: float) -> torch.Tensor:
         if weight <= 0 or mask.numel() == 0:
@@ -1723,9 +1727,21 @@ class AgenticUnifiedContrastiveLoss(ContrastiveARFLoss):
         )
         hard_negative_weight = max(1.0, float(source_weights.get("hard_negative_weight", self.hard_negative_weight)))
         if valid_indices.numel() > 0 and hasattr(memory, "edge_factor"):
-            edge_factor = memory.edge_factor(query_sample_ids, valid_indices, default=1.0).to(device=device, dtype=torch.float32)
+            edge_factor = memory.edge_factor(
+                query_sample_ids,
+                valid_indices,
+                default=self.edge_factor_default,
+                boost_scale=self.edge_factor_boost,
+                min_factor=self.edge_factor_min,
+                max_factor=self.edge_factor_max,
+            ).to(device=device, dtype=torch.float32)
         else:
-            edge_factor = torch.ones(query_count, valid_indices.numel(), dtype=torch.float32, device=device)
+            edge_factor = torch.full(
+                (query_count, valid_indices.numel()),
+                float(self.edge_factor_default),
+                dtype=torch.float32,
+                device=device,
+            )
 
         positive_weights = torch.zeros_like(logits, dtype=torch.float32)
         positive_weights[:, :query_count] += self._source_addition(view_mask, source_weight_view)

@@ -152,16 +152,37 @@ class PlannerMemoryBank:
 
     def _ensure_edge_slots(self, slots: int):
         slots = max(1, int(slots))
-        if self.edge_indices is not None and self.edge_indices.shape[1] == slots:
+        if self.edge_indices is not None and self.edge_indices.shape[1] >= slots:
             return
-        self.edge_indices = torch.full((self.num_items, slots), -1, dtype=torch.long, device=self.device)
-        self.prev_edge_indices = torch.full((self.num_items, slots), -1, dtype=torch.long, device=self.device)
-        self.edge_weight = torch.zeros(self.num_items, slots, dtype=torch.float32, device=self.device)
-        self.edge_posterior = torch.zeros(self.num_items, slots, dtype=torch.float32, device=self.device)
-        self.edge_reliability = torch.zeros(self.num_items, slots, dtype=torch.float32, device=self.device)
-        self.edge_decay = torch.zeros(self.num_items, slots, dtype=torch.float32, device=self.device)
-        self.edge_last_epoch = torch.zeros(self.num_items, slots, dtype=torch.long, device=self.device)
-        self.edge_flags = torch.zeros(self.num_items, slots, dtype=torch.int16, device=self.device)
+
+        old_slots = 0 if self.edge_indices is None else int(self.edge_indices.shape[1])
+        new_edge_indices = torch.full((self.num_items, slots), -1, dtype=torch.long, device=self.device)
+        new_prev_edge_indices = torch.full((self.num_items, slots), -1, dtype=torch.long, device=self.device)
+        new_edge_weight = torch.zeros(self.num_items, slots, dtype=torch.float32, device=self.device)
+        new_edge_posterior = torch.zeros(self.num_items, slots, dtype=torch.float32, device=self.device)
+        new_edge_reliability = torch.zeros(self.num_items, slots, dtype=torch.float32, device=self.device)
+        new_edge_decay = torch.zeros(self.num_items, slots, dtype=torch.float32, device=self.device)
+        new_edge_last_epoch = torch.zeros(self.num_items, slots, dtype=torch.long, device=self.device)
+        new_edge_flags = torch.zeros(self.num_items, slots, dtype=torch.int16, device=self.device)
+
+        if old_slots > 0:
+            new_edge_indices[:, :old_slots] = self.edge_indices
+            new_prev_edge_indices[:, :old_slots] = self.prev_edge_indices
+            new_edge_weight[:, :old_slots] = self.edge_weight
+            new_edge_posterior[:, :old_slots] = self.edge_posterior
+            new_edge_reliability[:, :old_slots] = self.edge_reliability
+            new_edge_decay[:, :old_slots] = self.edge_decay
+            new_edge_last_epoch[:, :old_slots] = self.edge_last_epoch
+            new_edge_flags[:, :old_slots] = self.edge_flags
+
+        self.edge_indices = new_edge_indices
+        self.prev_edge_indices = new_prev_edge_indices
+        self.edge_weight = new_edge_weight
+        self.edge_posterior = new_edge_posterior
+        self.edge_reliability = new_edge_reliability
+        self.edge_decay = new_edge_decay
+        self.edge_last_epoch = new_edge_last_epoch
+        self.edge_flags = new_edge_flags
 
     @torch.no_grad()
     def update_batch(
@@ -289,8 +310,9 @@ class PlannerMemoryBank:
                 planned_scores = torch.cat([planned_scores, planned_scores_b.detach().float().to(self.device)], dim=1)
                 actual_scores = torch.cat([actual_scores, actual_scores_b.detach().float().to(self.device)], dim=1)
 
-        slots = max(int(max_edges), planned_indices.shape[1] + actual_indices.shape[1], 1)
+        slots = max(int(max_edges), 1)
         self._ensure_edge_slots(slots)
+        slots = int(self.edge_indices.shape[1])
         indices = sample_indices.detach().long().to(self.device)
         posterior_momentum = float(posterior_momentum)
         reliability_momentum = float(reliability_momentum)
@@ -442,6 +464,9 @@ class PlannerMemoryBank:
         anchor_indices: torch.Tensor,
         candidate_indices: torch.Tensor,
         default: float = 1.0,
+        boost_scale: float = 1.0,
+        min_factor: float = 1.0,
+        max_factor: Optional[float] = None,
     ) -> torch.Tensor:
         anchors = anchor_indices.detach().long().to(self.device)
         candidates = candidate_indices.detach().long().to(self.device)
@@ -467,7 +492,11 @@ class PlannerMemoryBank:
         match = edge_indices.unsqueeze(1) == candidates.view(1, -1, 1)
         matched = match.any(dim=-1)
         matched_value = (match.float() * edge_value.unsqueeze(1)).max(dim=-1).values
-        return torch.where(matched, matched_value, factors)
+        matched_factor = float(default) + float(boost_scale) * matched_value
+        matched_factor = torch.clamp(matched_factor, min=float(min_factor))
+        if max_factor is not None and float(max_factor) > 0:
+            matched_factor = torch.clamp(matched_factor, max=float(max_factor))
+        return torch.where(matched, matched_factor, factors)
 
     @property
     def sem_dyn_valid(self) -> torch.Tensor:

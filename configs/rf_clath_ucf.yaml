@@ -129,6 +129,10 @@ agentic_contrastive:
   hard_mining_start_epoch: 30
   normalize_sources: true
   max_positive_weight: 2.0
+  edge_factor_default: 1.0
+  edge_factor_boost: 1.0
+  edge_factor_min: 1.0
+  edge_factor_max: 2.0
   source_weights:
     view: 1.0
     batch_neighbor: 0.75
