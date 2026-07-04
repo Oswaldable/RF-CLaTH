@@ -1866,6 +1866,7 @@ class AgenticUnifiedContrastiveLoss(ContrastiveARFLoss):
                 "edge_factor_mean": zero,
                 "false_edge_factor_mean": zero,
                 "persistent_false_count": zero,
+                "memory_negative_count": zero,
                 "trace_top_r": torch.tensor(float(trace_top_r), device=device),
                 "semantic_bits": route_data["metrics"]["semantic_bits"],
                 "temporal_bits": route_data["metrics"]["temporal_bits"],
@@ -1911,6 +1912,11 @@ class AgenticUnifiedContrastiveLoss(ContrastiveARFLoss):
             if valid_indices.numel() > 0
             else zero,
             "persistent_false_count": (
+                persistent_false_mask & (~current_feedback_positive_mask)
+            ).float().sum(dim=1).mean()
+            if valid_indices.numel() > 0
+            else zero,
+            "memory_negative_count": (
                 memory_negative_block_mask & (~current_feedback_positive_mask)
             ).float().sum(dim=1).mean()
             if valid_indices.numel() > 0
@@ -2009,6 +2015,7 @@ class AgenticUnifiedContrastiveLoss(ContrastiveARFLoss):
             "metric_agentic_hard_positive_count": metrics["hard_positive_count"],
             "metric_agentic_hard_negative_count": metrics["hard_negative_count"],
             "metric_agentic_persistent_false_count": metrics["persistent_false_count"],
+            "metric_agentic_memory_negative_count": metrics["memory_negative_count"],
             "metric_agentic_positive_weight_mean": metrics["positive_weight"],
             "metric_agentic_route_alpha": metrics["route_alpha_mean"],
             "metric_agentic_route_alpha_std": metrics["route_alpha_std"],
@@ -2170,6 +2177,7 @@ class PhasedAgenticUnifiedContrastiveLoss(AgenticUnifiedContrastiveLoss):
             "metric_agentic_hard_positive_count": metrics["hard_positive_count"],
             "metric_agentic_hard_negative_count": metrics["hard_negative_count"],
             "metric_agentic_persistent_false_count": metrics["persistent_false_count"],
+            "metric_agentic_memory_negative_count": metrics["memory_negative_count"],
             "metric_agentic_positive_weight_mean": metrics["positive_weight"],
             "metric_agentic_route_alpha": metrics["route_alpha_mean"],
             "metric_agentic_route_alpha_std": metrics["route_alpha_std"],
