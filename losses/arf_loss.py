@@ -1636,8 +1636,9 @@ class AgenticUnifiedContrastiveLoss(ContrastiveARFLoss):
                 "route_entropy": entropy.to(device),
             }
 
-        bce = F.binary_cross_entropy(
-            alpha.clamp(1e-6, 1.0 - 1e-6),
+        alpha_logits = torch.logit(alpha.clamp(1e-6, 1.0 - 1e-6))
+        bce = F.binary_cross_entropy_with_logits(
+            alpha_logits,
             target.clamp(1e-6, 1.0 - 1e-6),
             reduction="none",
         )
