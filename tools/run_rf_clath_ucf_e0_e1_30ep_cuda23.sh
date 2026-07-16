@@ -1,0 +1,88 @@
+#!/usr/bin/env bash
+set -uo pipefail
+
+PROJECT_ROOT=/mnt/disk2/yql/RF-CLaTH
+PYTHON_BIN=/mnt/disk2/yql/miniconda3/envs/mamba_env/bin/python
+OUTPUT_ROOT=/mnt/disk2/yql/RF-CLaTH_outputs
+LOG_ROOT=/mnt/disk2/yql/RF-CLaTH_run_logs
+
+GPU="${1:?usage: $0 <gpu> <e0|e1>}"
+CASE_ID="${2:?usage: $0 <gpu> <e0|e1>}"
+
+CONFIG=configs/rf_clath_ucf.yaml
+DATASET=s5vh_ucf
+BITS=32
+EPOCHS=30
+
+mkdir -p "$OUTPUT_ROOT" "$LOG_ROOT"
+
+timestamp() {
+  date '+%Y-%m-%d %H:%M:%S %Z'
+}
+
+overrides=(
+  "project.seed=3346"
+  "agentic.policy.use_routed_similarity=true"
+  "agentic.policy.update_feedback_graph=false"
+  "agentic.stop_policy.enabled=false"
+  "agentic_contrastive.actual_trace_start_epoch=999"
+  "agentic_contrastive.hard_mining_start_epoch=999"
+  "agentic_contrastive.memory_candidate_ramp_epochs=0"
+  "agentic_contrastive.memory_source_ramp_epochs=0"
+  "agentic_contrastive.memory_source_ramp_apply_to_arf=true"
+  "retrieval_environment.use_actual_trace=false"
+  "feedback.eta_missed_start=0.0"
+  "feedback.eta_false_start=0.0"
+  "feedback.eta_missed_final=0.0"
+  "feedback.eta_false_final=0.0"
+  "train.eval_interval=5"
+  "train.save_interval=5"
+)
+
+case "$CASE_ID" in
+  e0)
+    case_name=e0_routed_no_memory_30ep
+    project_name=RF-CLaTH-UCF-E0-RoutedNoMemory-30Ep
+    overrides+=("agentic_contrastive.memory_candidate_start_epoch=31")
+    ;;
+  e1)
+    case_name=e1_routed_memory_ramp_30ep
+    project_name=RF-CLaTH-UCF-E1-RoutedMemoryRamp-30Ep
+    overrides+=(
+      "agentic_contrastive.memory_candidate_start_epoch=6"
+      "agentic_contrastive.memory_candidate_ramp_epochs=5"
+      "agentic_contrastive.memory_source_ramp_epochs=5"
+    )
+    ;;
+  *)
+    echo "Unknown case=${CASE_ID}; expected e0 or e1." >&2
+    exit 2
+    ;;
+esac
+
+output_dir="${OUTPUT_ROOT}/rf_clath_ucf_e0_e1_30ep/${case_name}"
+command=(
+  "$PYTHON_BIN" train.py
+  --config "$CONFIG"
+  --dataset "$DATASET"
+  --device cuda
+  --output-dir "$output_dir"
+  --epochs "$EPOCHS"
+  --hash-bits "$BITS"
+  --override "project.name=${project_name}"
+)
+for override in "${overrides[@]}"; do
+  command+=(--override "$override")
+done
+
+log_file="${LOG_ROOT}/rf_clath_ucf_${CASE_ID}_30ep_cuda${GPU}_$(date +%Y%m%d_%H%M%S).queue.log"
+echo "$(timestamp) | case=${CASE_ID} name=${case_name} bits=${BITS} epochs=${EPOCHS} gpu=${GPU} log=${log_file}"
+cd "$PROJECT_ROOT" || exit 1
+if CUDA_VISIBLE_DEVICES="$GPU" PYTHONPATH="$PROJECT_ROOT" "${command[@]}" >> "$log_file" 2>&1; then
+  echo "$(timestamp) | case=${CASE_ID} completed on cuda${GPU}"
+  exit 0
+else
+  status=$?
+  echo "$(timestamp) | case=${CASE_ID} failed status=${status} on cuda${GPU}" >&2
+  exit "$status"
+fi

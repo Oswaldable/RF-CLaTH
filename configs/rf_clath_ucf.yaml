@@ -124,6 +124,8 @@ loss:
 
 agentic_contrastive:
   memory_positive_topk: 10
+  memory_candidate_topk: 0
+  memory_candidate_strategy: all
   arf_positive_topk: 10
   actual_trace_start_epoch: 30
   hard_mining_start_epoch: 30

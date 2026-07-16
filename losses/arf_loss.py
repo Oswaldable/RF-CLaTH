@@ -1354,6 +1354,24 @@ class AgenticUnifiedContrastiveLoss(ContrastiveARFLoss):
             int(agentic_cfg.get("memory_positive_topk", memory_cfg.get("positives_per_anchor", 10))),
         )
         self.arf_positive_topk = int(agentic_cfg.get("arf_positive_topk", self.arf_positive_topk))
+        self.memory_candidate_start_epoch = max(
+            1,
+            int(agentic_cfg.get("memory_candidate_start_epoch", memory_cfg.get("start_epoch", 1))),
+        )
+        self.memory_candidate_ramp_epochs = max(0, int(agentic_cfg.get("memory_candidate_ramp_epochs", 0)))
+        self.memory_candidate_topk = max(0, int(agentic_cfg.get("memory_candidate_topk", 0)))
+        self.memory_candidate_strategy = str(
+            agentic_cfg.get("memory_candidate_strategy", "all")
+        ).strip().lower()
+        if self.memory_candidate_strategy not in {"all", "hard", "uniform", "supervised_only"}:
+            raise ValueError(
+                "agentic_contrastive.memory_candidate_strategy must be one of "
+                "all, hard, uniform, supervised_only"
+            )
+        self.memory_source_ramp_epochs = max(0, int(agentic_cfg.get("memory_source_ramp_epochs", 0)))
+        self.memory_source_ramp_apply_to_arf = bool(
+            agentic_cfg.get("memory_source_ramp_apply_to_arf", True)
+        )
         self.actual_trace_start_epoch = int(agentic_cfg.get("actual_trace_start_epoch", 30))
         self.hard_mining_start_epoch = int(agentic_cfg.get("hard_mining_start_epoch", 30))
         self.normalize_sources = bool(agentic_cfg.get("normalize_sources", True))
@@ -1389,6 +1407,99 @@ class AgenticUnifiedContrastiveLoss(ContrastiveARFLoss):
             denom = mask_f.sum(dim=1, keepdim=True).clamp_min(1.0)
             return mask_f * (float(weight) / denom)
         return mask_f * float(weight)
+
+    def _logit_diagnostics(
+        self,
+        logits: torch.Tensor,
+        denom_logits: torch.Tensor,
+        batch_candidate_mask: torch.Tensor,
+        memory_candidate_mask: torch.Tensor,
+        positive_weights: torch.Tensor,
+        query_count: int,
+    ) -> Dict[str, torch.Tensor]:
+        zero = logits.detach().new_zeros(())
+
+        def masked_stats(values: torch.Tensor, mask: torch.Tensor) -> Tuple[torch.Tensor, ...]:
+            if values.numel() == 0 or mask.numel() == 0 or not bool(mask.any().item()):
+                return zero, zero, zero, zero
+            selected = values.detach().masked_select(mask)
+            return (
+                selected.mean(),
+                selected.std(unbiased=False) if selected.numel() > 1 else zero,
+                selected.amin(),
+                selected.amax(),
+            )
+
+        batch_mean, batch_std, batch_min, batch_max = masked_stats(
+            logits[:, :query_count],
+            batch_candidate_mask,
+        )
+        memory_logits = logits[:, query_count:]
+        memory_mean, memory_std, memory_min, memory_max = masked_stats(
+            memory_logits,
+            memory_candidate_mask,
+        )
+        memory_positive_mask = positive_weights[:, query_count:] > 0
+        memory_positive_mean, _, _, _ = masked_stats(memory_logits, memory_positive_mask)
+
+        if memory_logits.shape[1] > 0 and bool(memory_candidate_mask.any().item()):
+            batch_log_mass = torch.logsumexp(denom_logits[:, :query_count].detach(), dim=1)
+            memory_log_mass = torch.logsumexp(denom_logits[:, query_count:].detach(), dim=1)
+            memory_active_rows = memory_candidate_mask.any(dim=1)
+            mass_gap = (memory_log_mass - batch_log_mass)[memory_active_rows]
+            log_mass_gap = mass_gap.mean()
+            mass_ratio = torch.exp(mass_gap.clamp(-20.0, 20.0)).mean()
+        else:
+            log_mass_gap = zero
+            mass_ratio = zero
+
+        positive_gap = memory_positive_mean - memory_mean if bool(memory_positive_mask.any().item()) else zero
+        return {
+            "batch_logit_mean": batch_mean,
+            "batch_logit_std": batch_std,
+            "batch_logit_min": batch_min,
+            "batch_logit_max": batch_max,
+            "memory_logit_mean": memory_mean,
+            "memory_logit_std": memory_std,
+            "memory_logit_min": memory_min,
+            "memory_logit_max": memory_max,
+            "memory_denom_mass_ratio": mass_ratio,
+            "memory_denom_log_mass_gap": log_mass_gap,
+            "memory_positive_logit_mean": memory_positive_mean,
+            "memory_positive_logit_gap": positive_gap,
+        }
+
+    def _limit_memory_candidate_mask(
+        self,
+        memory_logits: torch.Tensor,
+        base_mask: torch.Tensor,
+        mandatory_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        """Select the configured memory pool while preserving supervised items."""
+        if self.memory_candidate_strategy == "supervised_only":
+            return mandatory_mask & base_mask
+        if (
+            self.memory_candidate_strategy == "all"
+            or self.memory_candidate_topk <= 0
+            or memory_logits.numel() == 0
+            or memory_logits.shape[1] <= self.memory_candidate_topk
+        ):
+            return base_mask
+        topk = min(self.memory_candidate_topk, memory_logits.shape[1])
+        selected_mask = torch.zeros_like(base_mask)
+        if self.memory_candidate_strategy == "uniform":
+            selected_columns = torch.linspace(
+                0,
+                memory_logits.shape[1] - 1,
+                steps=topk,
+                device=memory_logits.device,
+            ).round().long()
+            selected_mask[:, selected_columns] = True
+        else:
+            selection_logits = memory_logits.detach().masked_fill(~base_mask, float("-inf"))
+            selected_columns = torch.topk(selection_logits, k=topk, dim=1, largest=True).indices
+            selected_mask.scatter_(1, selected_columns, True)
+        return (selected_mask | mandatory_mask) & base_mask
 
     def _batch_neighbor_mask(
         self,
@@ -1577,6 +1688,18 @@ class AgenticUnifiedContrastiveLoss(ContrastiveARFLoss):
                 return None
             return int(epoch.detach().cpu().item())
         return int(epoch)
+
+    def _memory_ramp_scale(self, current_epoch: int | None, ramp_epochs: int) -> float:
+        if current_epoch is None:
+            return 1.0
+        if current_epoch < self.memory_candidate_start_epoch:
+            return 0.0
+        if ramp_epochs <= 0:
+            return 1.0
+        if ramp_epochs == 1:
+            return 1.0
+        progress = float(current_epoch - self.memory_candidate_start_epoch) / float(ramp_epochs - 1)
+        return min(1.0, max(0.0, progress))
 
     def _subcode_bits(self, outputs: Dict[str, torch.Tensor], key: str, fallback: int) -> int:
         value = outputs.get(key, fallback)
@@ -1771,6 +1894,26 @@ class AgenticUnifiedContrastiveLoss(ContrastiveARFLoss):
         trace_budget = self._action_budget(action, batch_size, device)
         trace_top_r = float(trace_budget.float().mean().detach().cpu().item())
         valid_indices_mem = self._memory_valid_indices(memory, action)
+        current_epoch = self._current_epoch_value(outputs)
+        if current_epoch is not None and current_epoch < self.memory_candidate_start_epoch:
+            valid_indices_mem = valid_indices_mem.new_empty(0)
+        memory_candidate_scale = self._memory_ramp_scale(current_epoch, self.memory_candidate_ramp_epochs)
+        if valid_indices_mem.numel() > 0 and memory_candidate_scale < 1.0:
+            candidate_count = min(
+                valid_indices_mem.numel(),
+                max(0, int(round(float(valid_indices_mem.numel()) * memory_candidate_scale))),
+            )
+            if candidate_count <= 0:
+                valid_indices_mem = valid_indices_mem.new_empty(0)
+            elif candidate_count < valid_indices_mem.numel():
+                positions = torch.linspace(
+                    0,
+                    valid_indices_mem.numel() - 1,
+                    steps=candidate_count,
+                    device=valid_indices_mem.device,
+                ).round().long()
+                valid_indices_mem = valid_indices_mem.index_select(0, positions)
+        memory_source_scale = self._memory_ramp_scale(current_epoch, self.memory_source_ramp_epochs)
         query_count = batch_size * 2
         query_base = torch.arange(query_count, device=device) % batch_size
         candidate_base = torch.arange(query_count, device=device) % batch_size
@@ -1795,8 +1938,6 @@ class AgenticUnifiedContrastiveLoss(ContrastiveARFLoss):
             memory_candidate_mask = ~memory_self_mask
         else:
             memory_candidate_mask = torch.zeros(query_count, 0, dtype=torch.bool, device=device)
-        candidate_mask = torch.cat([batch_candidate_mask, memory_candidate_mask], dim=1)
-
         view_mask = sample_indices[query_base].unsqueeze(1) == sample_indices[candidate_base].unsqueeze(0)
         view_mask = view_mask & batch_candidate_mask
         batch_neighbor_mask = self._batch_neighbor_mask(sample_indices, neighbor_indices, query_base, candidate_base)
@@ -1842,6 +1983,10 @@ class AgenticUnifiedContrastiveLoss(ContrastiveARFLoss):
         source_weight_missed_bonus = float(
             source_weights.get("arf_missed_bonus", self.source_weight_missed_bonus)
         )
+        source_weight_memory *= memory_source_scale
+        if self.memory_source_ramp_apply_to_arf:
+            source_weight_arf *= memory_source_scale
+            source_weight_missed_bonus *= memory_source_scale
         hard_negative_weight = max(1.0, float(source_weights.get("hard_negative_weight", self.hard_negative_weight)))
         if valid_indices.numel() > 0 and hasattr(memory, "edge_factor"):
             current_epoch = self._current_epoch_value(outputs)
@@ -1893,6 +2038,24 @@ class AgenticUnifiedContrastiveLoss(ContrastiveARFLoss):
                 (~memory_negative_block_mask) | current_feedback_positive_mask
             )
 
+        mandatory_memory_mask = (
+            memory_neighbor_mask
+            | current_feedback_positive_mask
+            | memory_negative_block_mask
+        )
+        memory_candidate_mask = self._limit_memory_candidate_mask(
+            memory_logits,
+            memory_candidate_mask,
+            mandatory_memory_mask,
+        )
+        memory_neighbor_mask = memory_neighbor_mask & memory_candidate_mask
+        arf_mask = arf_mask & memory_candidate_mask
+        hard_positive_mask = hard_positive_mask & memory_candidate_mask
+        hard_negative_mask = hard_negative_mask & memory_candidate_mask
+        memory_negative_block_mask = memory_negative_block_mask & memory_candidate_mask
+        current_feedback_positive_mask = current_feedback_positive_mask & memory_candidate_mask
+        candidate_mask = torch.cat([batch_candidate_mask, memory_candidate_mask], dim=1)
+
         positive_weights = torch.zeros_like(logits, dtype=torch.float32)
         positive_weights[:, :query_count] += self._source_addition(view_mask, source_weight_view)
         positive_weights[:, :query_count] += self._source_addition(batch_neighbor_mask, source_weight_batch)
@@ -1909,6 +2072,24 @@ class AgenticUnifiedContrastiveLoss(ContrastiveARFLoss):
 
         zero = outputs["u_a"].new_zeros(())
         valid_rows = (positive_weights > 0).any(dim=1) & candidate_mask.any(dim=1)
+        mask_value = -1e4 if logits.dtype in {torch.float16, torch.bfloat16} else -1e9
+        denom_logits = logits.masked_fill(~candidate_mask, mask_value)
+        if valid_indices.numel() > 0:
+            denom_bonus = torch.zeros_like(logits)
+            hard_negative_scale = hard_negative_feedback_weight * float(hard_negative_weight)
+            hard_negative_scale = hard_negative_scale.clamp_min(1.0)
+            denominator_hard_mask = memory_negative_block_mask & (~current_feedback_positive_mask)
+            denominator_scale = torch.maximum(hard_negative_scale, false_edge_factor).clamp_min(1.0)
+            denom_bonus[:, query_count:] = denominator_hard_mask.float() * torch.log(denominator_scale)
+            denom_logits = denom_logits + denom_bonus
+        logit_diagnostics = self._logit_diagnostics(
+            logits,
+            denom_logits,
+            batch_candidate_mask,
+            memory_candidate_mask,
+            positive_weights,
+            query_count,
+        )
         if not bool(valid_rows.any().item()):
             return zero, {
                 "targets_a": targets_a,
@@ -1932,21 +2113,17 @@ class AgenticUnifiedContrastiveLoss(ContrastiveARFLoss):
                 "false_edge_factor_mean": zero,
                 "persistent_false_count": zero,
                 "memory_negative_count": zero,
+                "memory_candidate_count": memory_candidate_mask.float().sum(dim=1).mean()
+                if memory_candidate_mask.numel() > 0
+                else zero,
+                "memory_candidate_scale": torch.tensor(float(memory_candidate_scale), device=device),
+                "memory_source_scale": torch.tensor(float(memory_source_scale), device=device),
+                **logit_diagnostics,
                 "trace_top_r": torch.tensor(float(trace_top_r), device=device),
                 "semantic_bits": route_data["metrics"]["semantic_bits"],
                 "temporal_bits": route_data["metrics"]["temporal_bits"],
             }
 
-        mask_value = -1e4 if logits.dtype in {torch.float16, torch.bfloat16} else -1e9
-        denom_logits = logits.masked_fill(~candidate_mask, mask_value)
-        if valid_indices.numel() > 0:
-            denom_bonus = torch.zeros_like(logits)
-            hard_negative_scale = hard_negative_feedback_weight * float(hard_negative_weight)
-            hard_negative_scale = hard_negative_scale.clamp_min(1.0)
-            denominator_hard_mask = memory_negative_block_mask & (~current_feedback_positive_mask)
-            denominator_scale = torch.maximum(hard_negative_scale, false_edge_factor).clamp_min(1.0)
-            denom_bonus[:, query_count:] = denominator_hard_mask.float() * torch.log(denominator_scale)
-            denom_logits = denom_logits + denom_bonus
         positive_logits = logits + torch.log(positive_weights.clamp_min(1e-12))
         positive_logits = positive_logits.masked_fill(positive_weights <= 0, mask_value)
         loss = torch.logsumexp(denom_logits, dim=1) - torch.logsumexp(positive_logits, dim=1)
@@ -1986,6 +2163,12 @@ class AgenticUnifiedContrastiveLoss(ContrastiveARFLoss):
             ).float().sum(dim=1).mean()
             if valid_indices.numel() > 0
             else zero,
+            "memory_candidate_count": memory_candidate_mask.float().sum(dim=1).mean()
+            if memory_candidate_mask.numel() > 0
+            else zero,
+            "memory_candidate_scale": torch.tensor(float(memory_candidate_scale), device=device),
+            "memory_source_scale": torch.tensor(float(memory_source_scale), device=device),
+            **logit_diagnostics,
             "positive_weight": positive_weights[pos_active].mean() if pos_active.any() else zero,
             "route_alpha_mean": route_data["metrics"]["route_alpha_mean"],
             "route_alpha_std": route_data["metrics"]["route_alpha_std"],
@@ -2084,6 +2267,21 @@ class AgenticUnifiedContrastiveLoss(ContrastiveARFLoss):
             "metric_agentic_hard_negative_count": metrics["hard_negative_count"],
             "metric_agentic_persistent_false_count": metrics["persistent_false_count"],
             "metric_agentic_memory_negative_count": metrics["memory_negative_count"],
+            "metric_agentic_memory_candidate_count": metrics["memory_candidate_count"],
+            "metric_agentic_memory_candidate_scale": metrics["memory_candidate_scale"],
+            "metric_agentic_memory_source_scale": metrics["memory_source_scale"],
+            "metric_agentic_batch_logit_mean": metrics["batch_logit_mean"],
+            "metric_agentic_batch_logit_std": metrics["batch_logit_std"],
+            "metric_agentic_batch_logit_min": metrics["batch_logit_min"],
+            "metric_agentic_batch_logit_max": metrics["batch_logit_max"],
+            "metric_agentic_memory_logit_mean": metrics["memory_logit_mean"],
+            "metric_agentic_memory_logit_std": metrics["memory_logit_std"],
+            "metric_agentic_memory_logit_min": metrics["memory_logit_min"],
+            "metric_agentic_memory_logit_max": metrics["memory_logit_max"],
+            "metric_agentic_memory_denom_mass_ratio": metrics["memory_denom_mass_ratio"],
+            "metric_agentic_memory_denom_log_mass_gap": metrics["memory_denom_log_mass_gap"],
+            "metric_agentic_memory_positive_logit_mean": metrics["memory_positive_logit_mean"],
+            "metric_agentic_memory_positive_logit_gap": metrics["memory_positive_logit_gap"],
             "metric_agentic_positive_weight_mean": metrics["positive_weight"],
             "metric_agentic_route_alpha": metrics["route_alpha_mean"],
             "metric_agentic_route_alpha_std": metrics["route_alpha_std"],
