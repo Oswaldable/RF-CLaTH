@@ -2,6 +2,13 @@
 
 更新时间：2026-07-20（Asia/Shanghai）
 
+结构化结果归档：
+
+- 阅读版总表：[`doc/ucf101_experiment_summary.md`](doc/ucf101_experiment_summary.md)
+- 实验级 CSV：[`doc/ucf101_experiment_summary.csv`](doc/ucf101_experiment_summary.csv)
+- mAP@100 曲线 CSV：[`doc/ucf101_map100_curves.csv`](doc/ucf101_map100_curves.csv)
+- H1 trace CSV：[`doc/ucf101_h1_trace_diagnostics.csv`](doc/ucf101_h1_trace_diagnostics.csv)
+
 ## 一、当前结论
 
 截至目前，UCF101 32-bit 的 C0-H1 实验已全部完成。
