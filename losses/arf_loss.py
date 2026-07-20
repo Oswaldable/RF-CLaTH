@@ -717,6 +717,33 @@ class ContrastiveARFLoss(HybridARFLoss):
             "metric_arf_actual_only_false_label_precision": avg_target_metric(
                 "metric_actual_only_false_label_precision"
             ),
+            "metric_arf_actual_overlap_at5": avg_target_metric("metric_actual_overlap_at5"),
+            "metric_arf_actual_overlap_at10": avg_target_metric("metric_actual_overlap_at10"),
+            "metric_arf_actual_overlap_at20": avg_target_metric("metric_actual_overlap_at20"),
+            "metric_arf_false_ratio_at5": avg_target_metric("metric_false_ratio_at5"),
+            "metric_arf_false_ratio_at10": avg_target_metric("metric_false_ratio_at10"),
+            "metric_arf_false_ratio_at20": avg_target_metric("metric_false_ratio_at20"),
+            "metric_arf_actual_label_precision_at5": avg_target_metric("metric_actual_label_precision_at5"),
+            "metric_arf_actual_label_precision_at10": avg_target_metric("metric_actual_label_precision_at10"),
+            "metric_arf_actual_label_precision_at20": avg_target_metric("metric_actual_label_precision_at20"),
+            "metric_arf_actual_only_false_label_precision_at5": avg_target_metric(
+                "metric_actual_only_false_label_precision_at5"
+            ),
+            "metric_arf_actual_only_false_label_precision_at10": avg_target_metric(
+                "metric_actual_only_false_label_precision_at10"
+            ),
+            "metric_arf_actual_only_false_label_precision_at20": avg_target_metric(
+                "metric_actual_only_false_label_precision_at20"
+            ),
+            "metric_arf_actual_only_planner_score_median": avg_target_metric(
+                "metric_actual_only_planner_score_median"
+            ),
+            "metric_arf_actual_only_high_score_label_precision": avg_target_metric(
+                "metric_actual_only_high_score_label_precision"
+            ),
+            "metric_arf_actual_only_low_score_label_precision": avg_target_metric(
+                "metric_actual_only_low_score_label_precision"
+            ),
             "metric_arf_retrieved_target_mean": avg_target_metric("metric_retrieved_target_mean"),
             "metric_arf_feedback_weight_mean": avg_target_metric("metric_feedback_weight_mean"),
             "metric_arf_eta_missed": torch.tensor(float(schedule["eta_missed"]), device=device),
@@ -2334,6 +2361,33 @@ class AgenticUnifiedContrastiveLoss(ContrastiveARFLoss):
             "metric_arf_missed_only_label_precision": avg_target_metric("metric_missed_only_label_precision"),
             "metric_arf_actual_only_false_label_precision": avg_target_metric(
                 "metric_actual_only_false_label_precision"
+            ),
+            "metric_arf_actual_overlap_at5": avg_target_metric("metric_actual_overlap_at5"),
+            "metric_arf_actual_overlap_at10": avg_target_metric("metric_actual_overlap_at10"),
+            "metric_arf_actual_overlap_at20": avg_target_metric("metric_actual_overlap_at20"),
+            "metric_arf_false_ratio_at5": avg_target_metric("metric_false_ratio_at5"),
+            "metric_arf_false_ratio_at10": avg_target_metric("metric_false_ratio_at10"),
+            "metric_arf_false_ratio_at20": avg_target_metric("metric_false_ratio_at20"),
+            "metric_arf_actual_label_precision_at5": avg_target_metric("metric_actual_label_precision_at5"),
+            "metric_arf_actual_label_precision_at10": avg_target_metric("metric_actual_label_precision_at10"),
+            "metric_arf_actual_label_precision_at20": avg_target_metric("metric_actual_label_precision_at20"),
+            "metric_arf_actual_only_false_label_precision_at5": avg_target_metric(
+                "metric_actual_only_false_label_precision_at5"
+            ),
+            "metric_arf_actual_only_false_label_precision_at10": avg_target_metric(
+                "metric_actual_only_false_label_precision_at10"
+            ),
+            "metric_arf_actual_only_false_label_precision_at20": avg_target_metric(
+                "metric_actual_only_false_label_precision_at20"
+            ),
+            "metric_arf_actual_only_planner_score_median": avg_target_metric(
+                "metric_actual_only_planner_score_median"
+            ),
+            "metric_arf_actual_only_high_score_label_precision": avg_target_metric(
+                "metric_actual_only_high_score_label_precision"
+            ),
+            "metric_arf_actual_only_low_score_label_precision": avg_target_metric(
+                "metric_actual_only_low_score_label_precision"
             ),
             "metric_arf_retrieved_target_mean": avg_target_metric("metric_retrieved_target_mean"),
             "metric_arf_feedback_weight_mean": avg_target_metric("metric_feedback_weight_mean"),

@@ -75,6 +75,50 @@ def _masked_label_precision(
     return hits[valid].float().mean()
 
 
+def _trace_prefix_diagnostics(
+    labels: Optional[torch.Tensor],
+    anchors: torch.Tensor,
+    planned_indices: torch.Tensor,
+    planned_mask: torch.Tensor,
+    actual_indices: torch.Tensor,
+    actual_mask: torch.Tensor,
+    depth: int,
+) -> Dict[str, torch.Tensor]:
+    """Compute read-only trace diagnostics for one retrieval depth."""
+
+    zero = torch.zeros((), dtype=torch.float32, device=anchors.device)
+    if actual_indices.numel() == 0 or depth <= 0:
+        return {
+            "overlap": zero,
+            "false_ratio": zero,
+            "actual_label_precision": zero,
+            "actual_only_false_label_precision": zero,
+        }
+    ranks = torch.arange(actual_indices.shape[1], device=anchors.device).unsqueeze(0)
+    prefix_mask = actual_mask & (ranks < int(depth))
+    matches = (
+        (planned_indices.unsqueeze(-1) == actual_indices.unsqueeze(1))
+        & planned_mask.unsqueeze(-1)
+        & prefix_mask.unsqueeze(1)
+    )
+    planned_hits = matches.any(dim=-1)
+    actual_hits = matches.any(dim=1)
+    overlap = planned_hits[planned_mask].float().mean() if planned_mask.any() else zero
+    false_mask = prefix_mask & (~actual_hits)
+    false_ratio = false_mask.float().sum() / prefix_mask.float().sum().clamp_min(1.0)
+    return {
+        "overlap": overlap,
+        "false_ratio": false_ratio,
+        "actual_label_precision": _masked_label_precision(labels, anchors, actual_indices, prefix_mask),
+        "actual_only_false_label_precision": _masked_label_precision(
+            labels,
+            anchors,
+            actual_indices,
+            false_mask,
+        ),
+    }
+
+
 class RetrievalGraphPlanner:
     """Planner Graph builder used for Stage 2 sanity diagnostics."""
 
@@ -385,6 +429,21 @@ class RetrievalGraphPlanner:
                 "metric_actual_label_precision": torch.zeros((), device=memory.device),
                 "metric_missed_only_label_precision": torch.zeros((), device=memory.device),
                 "metric_actual_only_false_label_precision": torch.zeros((), device=memory.device),
+                "metric_actual_overlap_at5": torch.zeros((), device=memory.device),
+                "metric_actual_overlap_at10": torch.zeros((), device=memory.device),
+                "metric_actual_overlap_at20": torch.zeros((), device=memory.device),
+                "metric_false_ratio_at5": torch.zeros((), device=memory.device),
+                "metric_false_ratio_at10": torch.zeros((), device=memory.device),
+                "metric_false_ratio_at20": torch.zeros((), device=memory.device),
+                "metric_actual_label_precision_at5": torch.zeros((), device=memory.device),
+                "metric_actual_label_precision_at10": torch.zeros((), device=memory.device),
+                "metric_actual_label_precision_at20": torch.zeros((), device=memory.device),
+                "metric_actual_only_false_label_precision_at5": torch.zeros((), device=memory.device),
+                "metric_actual_only_false_label_precision_at10": torch.zeros((), device=memory.device),
+                "metric_actual_only_false_label_precision_at20": torch.zeros((), device=memory.device),
+                "metric_actual_only_planner_score_median": torch.zeros((), device=memory.device),
+                "metric_actual_only_high_score_label_precision": torch.zeros((), device=memory.device),
+                "metric_actual_only_low_score_label_precision": torch.zeros((), device=memory.device),
                 "metric_retrieved_target_mean": torch.zeros((), device=memory.device),
                 "metric_feedback_weight_mean": torch.zeros((), device=memory.device),
             }
@@ -508,6 +567,39 @@ class RetrievalGraphPlanner:
             actual_indices,
             actual_only_false_mask,
         )
+        prefix_metrics = {
+            depth: _trace_prefix_diagnostics(
+                memory.labels,
+                anchors,
+                planned_indices,
+                planned_mask,
+                actual_indices,
+                actual_mask,
+                depth,
+            )
+            for depth in (5, 10, 20)
+        }
+        if actual_only_false_mask.any():
+            actual_only_scores = actual_scores[actual_only_false_mask]
+            actual_only_score_median = actual_only_scores.median()
+            high_score_mask = actual_only_false_mask & (actual_scores >= actual_only_score_median)
+            low_score_mask = actual_only_false_mask & (actual_scores < actual_only_score_median)
+            high_score_label_precision = _masked_label_precision(
+                memory.labels,
+                anchors,
+                actual_indices,
+                high_score_mask,
+            )
+            low_score_label_precision = _masked_label_precision(
+                memory.labels,
+                anchors,
+                actual_indices,
+                low_score_mask,
+            )
+        else:
+            actual_only_score_median = torch.zeros((), device=memory.device)
+            high_score_label_precision = torch.zeros((), device=memory.device)
+            low_score_label_precision = torch.zeros((), device=memory.device)
 
         return {
             "target_indices": target_indices,
@@ -535,6 +627,27 @@ class RetrievalGraphPlanner:
             "metric_actual_label_precision": actual_label_precision,
             "metric_missed_only_label_precision": missed_only_label_precision,
             "metric_actual_only_false_label_precision": actual_only_false_label_precision,
+            "metric_actual_overlap_at5": prefix_metrics[5]["overlap"],
+            "metric_actual_overlap_at10": prefix_metrics[10]["overlap"],
+            "metric_actual_overlap_at20": prefix_metrics[20]["overlap"],
+            "metric_false_ratio_at5": prefix_metrics[5]["false_ratio"],
+            "metric_false_ratio_at10": prefix_metrics[10]["false_ratio"],
+            "metric_false_ratio_at20": prefix_metrics[20]["false_ratio"],
+            "metric_actual_label_precision_at5": prefix_metrics[5]["actual_label_precision"],
+            "metric_actual_label_precision_at10": prefix_metrics[10]["actual_label_precision"],
+            "metric_actual_label_precision_at20": prefix_metrics[20]["actual_label_precision"],
+            "metric_actual_only_false_label_precision_at5": prefix_metrics[5][
+                "actual_only_false_label_precision"
+            ],
+            "metric_actual_only_false_label_precision_at10": prefix_metrics[10][
+                "actual_only_false_label_precision"
+            ],
+            "metric_actual_only_false_label_precision_at20": prefix_metrics[20][
+                "actual_only_false_label_precision"
+            ],
+            "metric_actual_only_planner_score_median": actual_only_score_median,
+            "metric_actual_only_high_score_label_precision": high_score_label_precision,
+            "metric_actual_only_low_score_label_precision": low_score_label_precision,
             "metric_retrieved_target_mean": retrieved_mean,
             "metric_feedback_weight_mean": feedback_mean,
         }

@@ -4,7 +4,7 @@
 
 ## 一、当前结论
 
-截至目前，UCF101 32-bit 的 C0-G1 实验已全部完成。
+截至目前，UCF101 32-bit 的 C0-H1 实验已全部完成。
 
 ```text
 当前最优 AUCL：E1，best.pth epoch 25，mAP@100=0.2705
@@ -24,7 +24,12 @@
    `0.0226`，相对提升约 `9.1%`。
 5. hard top-K、supervised-only 和 uniform-1024 均未超过全量 memory；当前不再继续
    memory candidate 裁剪路线。
-6. 下一阶段只开启 actual trace 做观察，暂不启用 hard mining 或 feedback graph。
+6. H0/H1 确认 actual trace 在关闭 hard mining、feedback graph 和反馈权重时对训练目标
+   基本中性，epoch 15 的 H1-H0 `mAP@100=-0.0008`。
+7. H1 的 actual-only 样本仍有很高的真实同类比例，epoch 15 为 `0.357`；集合意义上的
+   `false = actual - planned` 不能直接作为语义 hard negative。
+8. 当前仍不启用 missed/false loss、hard mining 或 feedback graph；下一阶段先做
+   top-r 和 planner-score 分层的只读语义诊断。
 
 当前主线配置固定为 E1：
 
@@ -222,7 +227,7 @@ neighbor_label_precision@20=0.0000
 等距抽取 2,000 个 anchor: precision@20 = 0.64445
 ```
 
-该问题只影响诊断日志，不影响训练。下一轮运行前应修正该函数。
+该问题只影响诊断日志，不影响训练。该函数已在 H0/H1 前修正。
 
 ### 6.2 Memory mass 诊断
 
@@ -232,7 +237,7 @@ G0 部分 query 没有 memory candidate 时，旧实现会让 `denom_gap` 被掩
 G0/G1 进程在修复前已经启动，因此本轮 G0 应忽略异常的 `denom_gap`，使用有效的
 `denom_ratio`；训练 loss 不受影响。
 
-## 七、下一步：H0/H1 Actual Trace 纯观察
+## 七、H0/H1 Actual Trace 纯观察
 
 ### 7.1 目标
 
@@ -333,30 +338,110 @@ actual trace 新增 label_p/a/m/f：
 远端验证：git diff --check / bash -n / py_compile / diagnostic smoke 均通过
 ```
 
-H0/H1 已在远端成对启动：
+第一次 H1 预跑暴露了一个 schedule 门控问题：`actual_trace_start_epoch=7` 会被
+`planner.warmup.epochs=10` 再次关闭。直接缩短 planner warmup 会改变
+`omega_s/omega_t/omega_z`，破坏 H0/H1 控制，因此修正为 actual trace 起点与 planner
+score warmup 独立。远端 schedule smoke 确认：
 
 ```text
-H0: cuda2, PID 2145532, trace off
-H1: cuda3, PID 2145533, trace from epoch 7
-启动时间：2026-07-20 20:57（Asia/Shanghai）
-output root: /mnt/disk2/yql/RF-CLaTH_outputs/rf_clath_ucf_h0_h1_actual_trace
-H0 log: /mnt/disk2/yql/RF-CLaTH_run_logs/rf_clath_ucf_h0_actual_trace_cuda2_20260720_125729.queue.log
-H1 log: /mnt/disk2/yql/RF-CLaTH_run_logs/rf_clath_ucf_h1_actual_trace_cuda3_20260720_125729.queue.log
+epoch 6: actual trace off
+epoch 7: actual trace on
+epoch 7 planner weights: omega_s/t/z = 0.65 / 0.35 / 0.0
+eta_missed/eta_false = 0 / 0
 ```
 
-epoch 1 首批日志中 H0/H1 的 loss、hash 和 planned label precision 一致，且
-feedback graph 明确关闭。最终门槛判断需等待 epoch 15 完成后填写。
+无效 H1 预跑在 epoch 7 step 20 停止，日志保留但不纳入结论。正式 H0/H1 均已完成：
+
+```text
+H0: cuda2, trace off, 2026-07-20 20:57-21:48（Asia/Shanghai）
+H1: cuda3, trace from epoch 7, 2026-07-20 21:18-21:59（Asia/Shanghai）
+output root: /mnt/disk2/yql/RF-CLaTH_outputs/rf_clath_ucf_h0_h1_actual_trace
+H0 log: /mnt/disk2/yql/RF-CLaTH_run_logs/rf_clath_ucf_h0_actual_trace_cuda2_20260720_125729.queue.log
+H1 log: /mnt/disk2/yql/RF-CLaTH_run_logs/rf_clath_ucf_h1_actual_trace_cuda3_20260720_131803.queue.log
+无效 H1 预跑: rf_clath_ucf_h1_actual_trace_cuda3_20260720_125729.queue.log
+```
+
+### 7.7 检索指标
+
+| Epoch | H0 mAP@100 | H1 mAP@100 | H1-H0 | H0 P@5 / R@100 | H1 P@5 / R@100 |
+|---:|---:|---:|---:|---:|---:|
+| 5 | 0.1697 | 0.1688 | -0.0009 | 0.5697 / 0.2592 | 0.5696 / 0.2583 |
+| 10 | 0.2277 | 0.2307 | +0.0030 | 0.6115 / 0.3135 | 0.6165 / 0.3140 |
+| 15 | **0.2538** | **0.2530** | **-0.0008** | 0.6439 / 0.3353 | 0.6435 / 0.3351 |
+
+两组的训练 loss 和 hash 轨迹一致；epoch 15 的差异远小于 `0.003`。因此 actual trace
+在当前只读设置下没有系统性改变训练目标，epoch 10 的 `+0.0030` 不应解释为增益。
+
+### 7.8 H1 trace 语义曲线
+
+| Epoch | Overlap | False ratio | Planned label | Actual label | Missed-only label | Actual-only false label | Entropy |
+|---:|---:|---:|---:|---:|---:|---:|---:|
+| 7  | 0.293 | 0.695 | 0.661 | 0.440 | 0.592 | 0.270 | 0.994 |
+| 8  | 0.301 | 0.688 | 0.661 | 0.453 | 0.590 | 0.283 | 0.995 |
+| 9  | 0.305 | 0.683 | 0.661 | 0.464 | 0.586 | 0.294 | 0.991 |
+| 10 | 0.314 | 0.675 | 0.661 | 0.478 | 0.581 | 0.305 | 0.992 |
+| 11 | 0.363 | 0.624 | 0.629 | 0.491 | 0.541 | 0.315 | 0.994 |
+| 12 | 0.369 | 0.618 | 0.630 | 0.505 | 0.539 | 0.332 | 0.993 |
+| 13 | 0.373 | 0.615 | 0.631 | 0.514 | 0.540 | 0.345 | 0.992 |
+| 14 | 0.377 | 0.611 | 0.630 | 0.518 | 0.539 | 0.351 | 0.990 |
+| 15 | **0.381** | **0.607** | **0.635** | **0.525** | **0.544** | **0.357** | **0.992** |
+
+全程 `bit_use=1.000`。actual overlap 和 actual label precision 随训练提高，但
+actual-only false label precision 也从 `0.270` 升到 `0.357`。这说明 hash retrieval
+逐渐找到更多同类样本，而 planner top-M 没覆盖其中相当一部分；这些样本只是集合上的
+`false`，并非语义负例。
+
+### 7.9 门槛判定
+
+| 门槛 | Epoch 15 | 结果 |
+|---|---:|---|
+| `abs(H1-H0 mAP@100) <= 0.003` | 0.0008 | 通过 |
+| `actual_overlap >= 0.20` | 0.381 | 通过 |
+| `false_ratio <= 0.80` | 0.607 | 通过 |
+| `planned label precision >= 0.55` | 0.635 | 通过 |
+| `actual label precision >= 0.55` | 0.525 | **未通过** |
+| `actual-only false label precision <= 0.20` | 0.357 | **未通过** |
+| `hash_entropy >= 0.90` | 0.992 | 通过 |
+| `bit_use >= 0.90` | 1.000 | 通过 |
+
+结论：H0/H1 未满足进入反馈训练的全部门槛。当前不能启用 false hard negative，
+也不能写 feedback graph；missed-only precision 只有 `0.544`，也不应直接加权训练。
+
+### 7.10 下一阶段 I0：多深度与 planner-score 只读诊断
+
+下一步仍保持 loss、hard mining 和 graph write 全部关闭，只补充一次 trace 诊断：
+
+1. 同一 Hamming trace 同时统计 `top-r = 5 / 10 / 20` 的 overlap、actual label precision
+   和 actual-only label precision，判断问题是否主要来自检索深度。
+2. 对 actual-only 样本按 planner score 分层，记录高/低 score 子集的覆盖率和 label
+   precision，判断 planner score 能否作为 label-free 的 false 过滤代理。
+3. 若低 top-r 能让 actual precision 达标，但 actual-only label precision仍高，则只允许
+   actual 作为候选正例/忽略项，不构造 false negatives。
+4. 只有找到不使用真实标签、且能把 actual-only 语义正例污染压到 `<=0.20` 的代理规则后，
+   才进入低权重反馈训练。
+
+I0 诊断实现已通过远端 `git diff --check`、`bash -n`、`py_compile` 和 toy trace smoke，
+并于 2026-07-20 22:05（Asia/Shanghai）在 cuda3 启动：
+
+```text
+PID: 2324214
+fixed trace budget: 20
+output root: /mnt/disk2/yql/RF-CLaTH_outputs/rf_clath_ucf_i0_trace_depth_score
+log: /mnt/disk2/yql/RF-CLaTH_run_logs/rf_clath_ucf_i0_trace_depth_score_cuda3_20260720_140548.queue.log
+script: tools/run_rf_clath_ucf_i0_trace_depth_score.sh
+```
 
 ## 八、明确暂不执行
 
-在 H0/H1 完成前，不执行：
+在 I0 诊断完成前，不执行：
 
 1. hard mining。
 2. feedback graph 写回。
-3. 继续缩小 memory candidate pool。
-4. 单独调整 memory temperature 或 L2 normalization。
-5. 16/64-bit 扩展和多 seed 正式实验。
-6. 128-bit 实验。
+3. missed/false feedback loss。
+4. 继续缩小 memory candidate pool。
+5. 单独调整 memory temperature 或 L2 normalization。
+6. 16/64-bit 扩展和多 seed 正式实验。
+7. 128-bit 实验。
 
 ## 九、实验产物索引
 
@@ -367,7 +452,8 @@ feedback graph 明确关闭。最终门槛判断需等待 epoch 15 完成后填�
 | E0-E1 | `/mnt/disk2/yql/RF-CLaTH_outputs/rf_clath_ucf_e0_e1_30ep/` | `rf_clath_ucf_e0_30ep_cuda2_20260715_160539.queue.log` / `rf_clath_ucf_e1_30ep_cuda3_20260715_160539.queue.log` / `tools/run_rf_clath_ucf_e0_e1_30ep_cuda23.sh` |
 | F0-F1 | `/mnt/disk2/yql/RF-CLaTH_outputs/rf_clath_ucf_f0_f1_topk/` | `rf_clath_ucf_f0_topk_cuda2_20260715_233840.queue.log` / `rf_clath_ucf_f1_topk_cuda3_20260715_233840.queue.log` / `tools/run_rf_clath_ucf_f0_f1_topk_cuda23.sh` |
 | G0-G1 | `/mnt/disk2/yql/RF-CLaTH_outputs/rf_clath_ucf_g0_g1_memory_pool/` | `rf_clath_ucf_g0_memory_pool_cuda2_20260716_011756.queue.log` / `rf_clath_ucf_g1_memory_pool_cuda3_20260716_011756.queue.log` / `tools/run_rf_clath_ucf_g0_g1_memory_pool_cuda23.sh` |
-| H0-H1 | `/mnt/disk2/yql/RF-CLaTH_outputs/rf_clath_ucf_h0_h1_actual_trace/` | `rf_clath_ucf_h0_actual_trace_cuda2_20260720_125729.queue.log` / `rf_clath_ucf_h1_actual_trace_cuda3_20260720_125729.queue.log` / `tools/run_rf_clath_ucf_h0_h1_actual_trace_cuda23.sh` |
+| H0-H1 | `/mnt/disk2/yql/RF-CLaTH_outputs/rf_clath_ucf_h0_h1_actual_trace/` | `rf_clath_ucf_h0_actual_trace_cuda2_20260720_125729.queue.log` / `rf_clath_ucf_h1_actual_trace_cuda3_20260720_131803.queue.log` / `tools/run_rf_clath_ucf_h0_h1_actual_trace_cuda23.sh` |
+| I0 | `/mnt/disk2/yql/RF-CLaTH_outputs/rf_clath_ucf_i0_trace_depth_score/` | `rf_clath_ucf_i0_trace_depth_score_cuda3_20260720_140548.queue.log` / `tools/run_rf_clath_ucf_i0_trace_depth_score.sh` |
 
 远端统一目录：
 
