@@ -49,6 +49,32 @@ def _row_overlap(left: torch.Tensor, right: torch.Tensor) -> float:
     return float(hits.mean().detach().cpu().item())
 
 
+def _masked_label_precision(
+    labels: Optional[torch.Tensor],
+    anchors: torch.Tensor,
+    neighbors: torch.Tensor,
+    mask: torch.Tensor,
+) -> torch.Tensor:
+    """Return semantic-label precision for a masked neighbor set (diagnostic only)."""
+
+    zero = torch.zeros((), dtype=torch.float32, device=anchors.device)
+    if labels is None or neighbors.numel() == 0 or not mask.any():
+        return zero
+    anchor_labels = labels[anchors]
+    neighbor_labels = labels[neighbors]
+    if anchor_labels.ndim == 1:
+        hits = neighbor_labels == anchor_labels.unsqueeze(1)
+        return hits[mask].float().mean() if mask.any() else zero
+
+    anchor_labels = anchor_labels.float().flatten(start_dim=1)
+    neighbor_labels = neighbor_labels.float().flatten(start_dim=2)
+    valid = mask & (anchor_labels.sum(dim=-1) > 0).unsqueeze(1) & (neighbor_labels.sum(dim=-1) > 0)
+    if not valid.any():
+        return zero
+    hits = (neighbor_labels * anchor_labels.unsqueeze(1)).sum(dim=-1) > 0
+    return hits[valid].float().mean()
+
+
 class RetrievalGraphPlanner:
     """Planner Graph builder used for Stage 2 sanity diagnostics."""
 
@@ -355,6 +381,10 @@ class RetrievalGraphPlanner:
                 "metric_actual_overlap": torch.zeros((), device=memory.device),
                 "metric_false_ratio": torch.zeros((), device=memory.device),
                 "metric_missed_ratio": torch.zeros((), device=memory.device),
+                "metric_planned_label_precision": torch.zeros((), device=memory.device),
+                "metric_actual_label_precision": torch.zeros((), device=memory.device),
+                "metric_missed_only_label_precision": torch.zeros((), device=memory.device),
+                "metric_actual_only_false_label_precision": torch.zeros((), device=memory.device),
                 "metric_retrieved_target_mean": torch.zeros((), device=memory.device),
                 "metric_feedback_weight_mean": torch.zeros((), device=memory.device),
             }
@@ -421,9 +451,14 @@ class RetrievalGraphPlanner:
         target_scores = torch.cat([planned_values, actual_scores, random_scores], dim=1)
         target_mask = torch.cat([planned_mask, actual_mask, random_mask], dim=1)
 
-        in_planned = (target_indices.unsqueeze(-1) == planned_indices.unsqueeze(1)).any(dim=-1)
+        in_planned = (
+            (target_indices.unsqueeze(-1) == planned_indices.unsqueeze(1)) & planned_mask.unsqueeze(1)
+        ).any(dim=-1)
         in_actual = (
-            (target_indices.unsqueeze(-1) == actual_indices.unsqueeze(1)).any(dim=-1)
+            (
+                (target_indices.unsqueeze(-1) == actual_indices.unsqueeze(1))
+                & actual_mask.unsqueeze(1)
+            ).any(dim=-1)
             if actual_indices.numel() > 0
             else torch.zeros_like(target_mask)
         )
@@ -439,8 +474,13 @@ class RetrievalGraphPlanner:
         weights = weights * target_mask.float()
 
         if actual_indices.numel() > 0:
-            planned_actual_hits = (planned_indices.unsqueeze(-1) == actual_indices.unsqueeze(1)).any(dim=-1)
-            actual_planned_hits = (actual_indices.unsqueeze(-1) == planned_indices.unsqueeze(1)).any(dim=-1)
+            planned_actual_matches = (
+                (planned_indices.unsqueeze(-1) == actual_indices.unsqueeze(1))
+                & planned_mask.unsqueeze(-1)
+                & actual_mask.unsqueeze(1)
+            )
+            planned_actual_hits = planned_actual_matches.any(dim=-1)
+            actual_planned_hits = planned_actual_matches.any(dim=1)
             overlap = planned_actual_hits[planned_mask].float().mean() if planned_mask.any() else torch.zeros((), device=memory.device)
             false_ratio = (~actual_planned_hits & actual_mask).float().sum() / actual_mask.float().sum().clamp_min(1.0)
             retrieved_mean = actual_scores[actual_mask].mean() if actual_mask.any() else torch.zeros((), device=memory.device)
@@ -448,8 +488,26 @@ class RetrievalGraphPlanner:
             overlap = torch.zeros((), device=memory.device)
             false_ratio = torch.zeros((), device=memory.device)
             retrieved_mean = torch.zeros((), device=memory.device)
+            planned_actual_hits = torch.zeros_like(planned_mask)
+            actual_planned_hits = torch.zeros_like(actual_mask)
         missed_ratio = missed.float().sum() / (in_planned & target_mask).float().sum().clamp_min(1.0)
         feedback_mean = weights[target_mask].mean() if target_mask.any() else torch.zeros((), device=memory.device)
+        missed_only_mask = planned_mask & (~planned_actual_hits)
+        actual_only_false_mask = actual_mask & (~actual_planned_hits)
+        planned_label_precision = _masked_label_precision(memory.labels, anchors, planned_indices, planned_mask)
+        actual_label_precision = _masked_label_precision(memory.labels, anchors, actual_indices, actual_mask)
+        missed_only_label_precision = _masked_label_precision(
+            memory.labels,
+            anchors,
+            planned_indices,
+            missed_only_mask,
+        )
+        actual_only_false_label_precision = _masked_label_precision(
+            memory.labels,
+            anchors,
+            actual_indices,
+            actual_only_false_mask,
+        )
 
         return {
             "target_indices": target_indices,
@@ -473,6 +531,10 @@ class RetrievalGraphPlanner:
             "metric_actual_overlap": overlap,
             "metric_false_ratio": false_ratio,
             "metric_missed_ratio": missed_ratio,
+            "metric_planned_label_precision": planned_label_precision,
+            "metric_actual_label_precision": actual_label_precision,
+            "metric_missed_only_label_precision": missed_only_label_precision,
+            "metric_actual_only_false_label_precision": actual_only_false_label_precision,
             "metric_retrieved_target_mean": retrieved_mean,
             "metric_feedback_weight_mean": feedback_mean,
         }

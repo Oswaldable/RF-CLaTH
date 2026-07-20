@@ -711,6 +711,12 @@ class ContrastiveARFLoss(HybridARFLoss):
             "metric_arf_actual_overlap": avg_target_metric("metric_actual_overlap"),
             "metric_arf_false_ratio": avg_target_metric("metric_false_ratio"),
             "metric_arf_missed_ratio": avg_target_metric("metric_missed_ratio"),
+            "metric_arf_planned_label_precision": avg_target_metric("metric_planned_label_precision"),
+            "metric_arf_actual_label_precision": avg_target_metric("metric_actual_label_precision"),
+            "metric_arf_missed_only_label_precision": avg_target_metric("metric_missed_only_label_precision"),
+            "metric_arf_actual_only_false_label_precision": avg_target_metric(
+                "metric_actual_only_false_label_precision"
+            ),
             "metric_arf_retrieved_target_mean": avg_target_metric("metric_retrieved_target_mean"),
             "metric_arf_feedback_weight_mean": avg_target_metric("metric_feedback_weight_mean"),
             "metric_arf_eta_missed": torch.tensor(float(schedule["eta_missed"]), device=device),
@@ -950,6 +956,12 @@ class AgenticUnifiedContrastiveLossV2(ContrastiveARFLoss):
             "metric_arf_actual_overlap": avg_target_metric("metric_actual_overlap"),
             "metric_arf_false_ratio": avg_target_metric("metric_false_ratio"),
             "metric_arf_missed_ratio": avg_target_metric("metric_missed_ratio"),
+            "metric_arf_planned_label_precision": avg_target_metric("metric_planned_label_precision"),
+            "metric_arf_actual_label_precision": avg_target_metric("metric_actual_label_precision"),
+            "metric_arf_missed_only_label_precision": avg_target_metric("metric_missed_only_label_precision"),
+            "metric_arf_actual_only_false_label_precision": avg_target_metric(
+                "metric_actual_only_false_label_precision"
+            ),
             "metric_arf_retrieved_target_mean": avg_target_metric("metric_retrieved_target_mean"),
             "metric_arf_feedback_weight_mean": memory_metrics["positive_weight_mean"],
             "metric_arf_eta_missed": torch.tensor(float(schedule["eta_missed"]), device=device),
@@ -1689,6 +1701,17 @@ class AgenticUnifiedContrastiveLoss(ContrastiveARFLoss):
             return int(epoch.detach().cpu().item())
         return int(epoch)
 
+    def _agentic_schedule(self, epoch: int) -> Dict[str, float | bool]:
+        """Keep the explicit actual-trace start independent of planner score warmup."""
+
+        schedule = dict(self._schedule(epoch))
+        trace_start_reached = self.actual_trace_start_epoch <= 0 or epoch >= self.actual_trace_start_epoch
+        schedule["use_actual_trace"] = bool(self.use_actual_trace) and trace_start_reached
+        if not schedule["use_actual_trace"]:
+            schedule["eta_missed"] = 0.0
+            schedule["eta_false"] = 0.0
+        return schedule
+
     def _memory_ramp_scale(self, current_epoch: int | None, ramp_epochs: int) -> float:
         if current_epoch is None:
             return 1.0
@@ -2202,12 +2225,7 @@ class AgenticUnifiedContrastiveLoss(ContrastiveARFLoss):
 
         epoch_tensor = outputs.get("epoch", torch.ones((), device=device))
         epoch = int(epoch_tensor.detach().cpu().item()) if torch.is_tensor(epoch_tensor) else int(epoch_tensor)
-        schedule = self._schedule(epoch)
-        if self.actual_trace_start_epoch > 0 and epoch < self.actual_trace_start_epoch:
-            schedule = dict(schedule)
-            schedule["use_actual_trace"] = False
-            schedule["eta_missed"] = 0.0
-            schedule["eta_false"] = 0.0
+        schedule = self._agentic_schedule(epoch)
         hard_mining_enabled = bool(schedule["use_actual_trace"]) and (
             self.hard_mining_start_epoch <= 0 or epoch >= self.hard_mining_start_epoch
         )
@@ -2311,6 +2329,12 @@ class AgenticUnifiedContrastiveLoss(ContrastiveARFLoss):
             "metric_arf_actual_overlap": avg_target_metric("metric_actual_overlap"),
             "metric_arf_false_ratio": avg_target_metric("metric_false_ratio"),
             "metric_arf_missed_ratio": avg_target_metric("metric_missed_ratio"),
+            "metric_arf_planned_label_precision": avg_target_metric("metric_planned_label_precision"),
+            "metric_arf_actual_label_precision": avg_target_metric("metric_actual_label_precision"),
+            "metric_arf_missed_only_label_precision": avg_target_metric("metric_missed_only_label_precision"),
+            "metric_arf_actual_only_false_label_precision": avg_target_metric(
+                "metric_actual_only_false_label_precision"
+            ),
             "metric_arf_retrieved_target_mean": avg_target_metric("metric_retrieved_target_mean"),
             "metric_arf_feedback_weight_mean": avg_target_metric("metric_feedback_weight_mean"),
             "metric_arf_eta_missed": torch.tensor(float(schedule["eta_missed"]), device=device),

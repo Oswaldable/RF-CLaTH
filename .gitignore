@@ -9,3 +9,4 @@ checkpoints/
 server_logs/
 *.pth
 *.pt
+.docx_work/

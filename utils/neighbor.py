@@ -116,10 +116,8 @@ def load_or_build_neighbors(
 def estimate_neighbor_label_precision(dataset, neighbor_indices: torch.Tensor, max_items: int = 2000) -> float:
     """Diagnostic only: estimate how often raw nearest neighbors share labels."""
 
-    if not hasattr(dataset, "records") or len(dataset.records) == 0:
-        return 0.0
     total = len(dataset)
-    count = min(int(max_items), total)
+    count = total if int(max_items) <= 0 else min(int(max_items), total)
     if count <= 0:
         return 0.0
     if count < total:
@@ -127,16 +125,37 @@ def estimate_neighbor_label_precision(dataset, neighbor_indices: torch.Tensor, m
     else:
         probe = torch.arange(total)
 
+    labels = getattr(dataset, "labels", None)
+    if labels is not None:
+        labels = torch.as_tensor(labels).detach().cpu()
+        neighbors = neighbor_indices.detach().long().cpu()[probe]
+        anchor_labels = labels[probe]
+        neighbor_labels = labels[neighbors]
+        if anchor_labels.ndim == 1:
+            return float((neighbor_labels == anchor_labels.unsqueeze(1)).float().mean().item())
+
+        anchor_labels = anchor_labels.float().flatten(start_dim=1)
+        neighbor_labels = neighbor_labels.float().flatten(start_dim=2)
+        valid = (anchor_labels.sum(dim=-1) > 0).unsqueeze(1) & (neighbor_labels.sum(dim=-1) > 0)
+        if not valid.any():
+            return 0.0
+        hits = (neighbor_labels * anchor_labels.unsqueeze(1)).sum(dim=-1) > 0
+        return float(hits[valid].float().mean().item())
+
+    records = getattr(dataset, "records", None)
+    if not records:
+        return 0.0
+
     hits = []
     for index in probe.tolist():
-        labels = set(dataset.records[index].get("labels", []))
-        if not labels:
+        item_labels = set(records[index].get("labels", []))
+        if not item_labels:
             continue
         local_hits = []
         for neighbor in neighbor_indices[index].tolist():
-            other = set(dataset.records[neighbor].get("labels", []))
+            other = set(records[neighbor].get("labels", []))
             if other:
-                local_hits.append(1.0 if labels.intersection(other) else 0.0)
+                local_hits.append(1.0 if item_labels.intersection(other) else 0.0)
         if local_hits:
             hits.append(sum(local_hits) / len(local_hits))
     if not hits:
